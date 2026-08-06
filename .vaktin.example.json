@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to .vaktin.json in the ROOT of a repository you want Vaktin to watch. Every key is optional; a repo with no config still gets branches and tags. Config lives here, in the project that owns these facts, so the tool stays generic and private identifiers never reach it.",
+
+  "name": "my-service",
+
+  "_fleet": "Deploy target to join tags against, so Vaktin can answer 'was this tag ACTUALLY built?'. balenaCloud slug today. Omit and tags are listed without build state.",
+  "fleet": "myorg/my-fleet",
+
+  "_deploy_workflow": "GitHub Actions workflow NAME (not filename) for the deploy. Used for the ETA median over your last five successful runs, and to find the run behind a tag that never built.",
+  "deploy_workflow": "Deploy to Production",
+
+  "_gate_timeout_minutes": "The blocking gate's timeout-minutes. Set this. It is what lets Vaktin tell a TIMEOUT kill from a CONCURRENCY eviction — GitHub reports both as 'cancelled' with the deploy 'skipped', they look identical, and their remedies are opposite: re-run fixes eviction and is useless against a timeout, because a rerun reads the same ceiling and dies at the same minute.",
+  "gate_timeout_minutes": 90,
+
+  "trunk": "main",
+  "tag_glob": "v*"
+}
