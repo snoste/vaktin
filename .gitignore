@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 # A real config belongs in the repo being WATCHED, never in this one.
 .vaktin.json
+
+# Watched clones live here on a real install. NEVER track them: they are other
+# people's repositories, often private, and `git add -A` will happily commit a
+# gitlink to one. (It did, once.)
+repos/
