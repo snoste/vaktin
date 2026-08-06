@@ -83,7 +83,15 @@ def repo_list():
 
 
 def repo_config(root):
-    """`.vaktin.json` from the repo itself. Every key optional."""
+    """`.vaktin.json` from the repo itself. Every key optional.
+
+    Working tree first, so editing config locally takes effect immediately.
+    Falling back to the tracked copy on a REF matters for how this is actually
+    deployed: a clone Vaktin only ever `git fetch`es and never checks out. Its
+    refs stay current while its working tree is frozen at whatever was cloned,
+    so config read only from disk would go stale — silently — the first time
+    someone changed it upstream.
+    """
     cfg = {}
     f = os.path.join(root, ".vaktin.json")
     if os.path.isfile(f):
@@ -91,6 +99,15 @@ def repo_config(root):
             cfg = json.load(open(f)) or {}
         except Exception:
             cfg = {}
+    if not cfg:
+        for ref in ("origin/main", "origin/master", "HEAD"):
+            raw = run(["git", "show", f"{ref}:.vaktin.json"], 10, root)
+            if raw:
+                try:
+                    cfg = json.loads(raw) or {}
+                    break
+                except Exception:
+                    pass
     cfg.setdefault("name", os.path.basename(root.rstrip("/")))
     cfg.setdefault("tag_glob", "v*")
     cfg.setdefault("trunk", "main")
