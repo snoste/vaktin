@@ -328,9 +328,38 @@ def classify_miss(tag, runs, cfg):
             ".vaktin.json til að greina tímaþak frá útrýmingu")
 
 
+def release_titles(root):
+    """version → human title, read from RELEASE.md's own headings.
+
+    Snorri (2026-08-06): the tag list said WHAT was building but never what it
+    WAS — "v5.9.15" is a number, "Stillingaafrit: vélin í einni skrá" is an
+    answer. The titles already exist as the release-notes headings
+    (`# Bláberg Edge Node vX.Y.Z — Title`), so read them instead of inventing
+    a second naming scheme. Fallback per tag: the annotated tag's own subject.
+    """
+    titles = {}
+    # From origin/main's blob, not the mirror's working tree: branches() fetches
+    # refs on every gather but nothing ever checks the tree out, so the on-disk
+    # RELEASE.md is frozen at clone time and silently loses every new title.
+    text = run(["git", "show", "origin/main:RELEASE.md"], cwd=root)
+    for line in text.splitlines():
+        m = re.match(r"#\s+.*?\bv?(\d+\.\d+\.\d+[\w.-]*)\s+—\s+(.+)", line)
+        if m and m.group(1) not in titles:
+            titles[m.group(1)] = m.group(2).strip()
+    return titles
+
+
+def tag_subject(root, tag):
+    """The annotated tag's message subject — fallback when RELEASE.md has no
+    heading for this version (e.g. a tag cut without notes)."""
+    s = run(["git", "tag", "-l", "--format=%(contents:subject)", tag], cwd=root)
+    return "" if s.startswith("Release v") else s   # the script's boilerplate says nothing
+
+
 def releases(root, cfg):
     """Tags joined to what was actually built — the join nothing else does."""
     built, ok = built_map(cfg)
+    titles = release_titles(root)
     runs = deploy_runs(root, cfg) if ok is not None else {}
     tags = run(["git", "tag", "-l", cfg["tag_glob"], "--sort=-v:refname"],
                cwd=root).splitlines()[:10]
@@ -374,7 +403,8 @@ def releases(root, cfg):
             _, note = classify_miss(t, runs, cfg)
         else:
             state = "unknown"
-        out.append({"tag": t, "state": state, "note": note})
+        out.append({"tag": t, "state": state, "note": note,
+                    "title": titles.get(sem) or tag_subject(root, t)})
     return out, ok
 
 
@@ -526,7 +556,7 @@ def project_section(p, multi):
 
     # releases — the join that catches a tag which never built
     s.append('<h2>Útgáfur — merki → byggð?</h2><div class="card"><table>'
-             "<tr><th>Merki</th><th>Staða</th><th></th></tr>")
+             "<tr><th>Merki</th><th>Hvað</th><th>Staða</th><th></th></tr>")
     for r in p["releases"]:
         st = r["state"]
         kind, label, note = "idle", st, ""
@@ -544,7 +574,9 @@ def project_section(p, multi):
             kind, label = "busy", "byggist"
         elif st == "unknown":
             kind, label = "idle", "óþekkt"
-        s.append(f'<tr><td class="mono">{html.escape(r["tag"])}</td><td>{pill(label, kind)}</td>'
+        s.append(f'<tr><td class="mono">{html.escape(r["tag"])}</td>'
+                 f'<td>{html.escape(r.get("title") or "")}</td>'
+                 f'<td>{pill(label, kind)}</td>'
                  f'<td class="muted">{html.escape(note)}</td></tr>')
     s.append("</table></div>")
     if p["built_ok"] is False:
