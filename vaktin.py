@@ -512,18 +512,63 @@ def _listener_alive(rdir):
                           capture_output=True).returncode == 0
 
 
+def _runner_busy(rdir):
+    """A runner executing a job has a Runner.Worker child. A stale-queue
+    revival must NEVER kickstart a busy runner — that kills a live job."""
+    return subprocess.run(["pgrep", "-f", os.path.join(rdir, "bin", "Runner.Worker")],
+                          capture_output=True).returncode == 0
+
+
 def _revive(label):
     return subprocess.run(
         ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
         capture_output=True, text=True)
 
 
+def _queue_is_stalled():
+    """True when work is QUEUED but nothing at all is running — the second way
+    a runner dies. A listener can survive as a process while its long-poll
+    session goes stale (seen after a GitHub Actions outage + a cancelled run):
+    the platform shows the runner idle, jobs queue forever, and no process
+    check can see it. The signature is queued-with-nothing-in-progress across
+    every watched project for a sustained spell."""
+    data = _cache.get("data") or {}
+    queued = running = 0
+    for p in data.get("projects", []):
+        for r in p.get("runs", []):
+            if r["status"] == "in_progress":
+                running += 1
+            else:
+                queued += 1
+    return queued > 0 and running == 0
+
+
+STALE_QUEUE_TICKS = 3        # consecutive watcher ticks (× RUNNER_CHECK_SECONDS)
+
+
 def runner_watch_loop():
     fails = {}                       # label → {count, last_attempt}
+    stalled_ticks = 0
     while True:
+        # Keep the picture fresh even with no browser open — the stall check
+        # reads the same cache the page does.
+        try:
+            gather()
+        except Exception:
+            pass
+        # Stale-idle revival: sustained queued-but-nothing-running revives every
+        # watched runner (rate-limited by the same cooldown bookkeeping below,
+        # via a synthetic "dead" pass). One tick is normal scheduling latency;
+        # several in a row is a wedged listener session.
+        stalled_ticks = stalled_ticks + 1 if _queue_is_stalled() else 0
+        force_revive = stalled_ticks >= STALE_QUEUE_TICKS
+        if force_revive:
+            stalled_ticks = 0
         rows = []
         for r in runner_installs():
-            alive = _listener_alive(r["dir"])
+            # force_revive treats an ALIVE-but-idle listener as dead (stale
+            # session); a busy runner is exempt — it is provably not the problem.
+            alive = _listener_alive(r["dir"]) and not (force_revive and not _runner_busy(r["dir"]))
             f = fails.setdefault(r["label"], {"count": 0, "last": 0.0})
             state = "ok"
             if alive:
@@ -538,9 +583,10 @@ def runner_watch_loop():
                 state = "endurræstur" if revived else "endurræsing-mistókst"
                 if revived:
                     f["count"] = 0
+                why = " (biðröð föst)" if force_revive else ""
                 _runners["events"].insert(0, {
                     "ts": time.strftime("%H:%M:%S"), "runner": r["name"],
-                    "action": ("endurræsti keyrarann" if revived
+                    "action": ((f"endurræsti keyrarann{why}") if revived
                                else f"endurræsing mistókst ({f['count']}/{RUNNER_GIVE_UP_AFTER})")})
                 del _runners["events"][20:]
             else:
