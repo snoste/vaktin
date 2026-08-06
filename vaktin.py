@@ -430,23 +430,41 @@ def in_flight(root, cfg):
                              "id": r["databaseId"]})
     except Exception:
         pass
-    # ETA from the median of recent successful deploys — the honest number, not
-    # a guess. Needs a workflow name, which is per-project, hence the config.
-    eta = 0
-    wf = cfg.get("deploy_workflow")
-    if wf:
-        raw = run(["gh", "run", "list", "--workflow", wf, "--status", "success",
-                   "--limit", "5", "--json", "startedAt,updatedAt"], 30, root)
-        try:
-            ds = []
-            for r in json.loads(raw or "[]"):
-                a = time.mktime(time.strptime(r["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
-                b = time.mktime(time.strptime(r["updatedAt"], "%Y-%m-%dT%H:%M:%SZ"))
-                ds.append((b - a) / 60)
-            eta = int(sorted(ds)[len(ds) // 2]) if ds else 0
-        except Exception:
-            pass
+    # Per-WORKFLOW ETA from the median of its own recent successes — the honest
+    # number, not a guess. Cached for a while: medians move slowly and each one
+    # costs a gh call. Every running row can then show a real progress fill,
+    # not just the configured deploy workflow.
+    for r in runs:
+        if r["status"] == "in_progress":
+            r["eta"] = _workflow_eta(root, r["name"])
+    eta = _workflow_eta(root, cfg.get("deploy_workflow")) if cfg.get("deploy_workflow") else 0
     return runs, eta
+
+
+_eta_cache = {}                      # workflow name → (fetched_at, minutes)
+ETA_CACHE_SECONDS = 600
+
+
+def _workflow_eta(root, workflow):
+    if not workflow:
+        return 0
+    hit = _eta_cache.get(workflow)
+    if hit and time.time() - hit[0] < ETA_CACHE_SECONDS:
+        return hit[1]
+    eta = 0
+    raw = run(["gh", "run", "list", "--workflow", workflow, "--status", "success",
+               "--limit", "5", "--json", "startedAt,updatedAt"], 30, root)
+    try:
+        ds = []
+        for r in json.loads(raw or "[]"):
+            a = time.mktime(time.strptime(r["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+            b = time.mktime(time.strptime(r["updatedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+            ds.append((b - a) / 60)
+        eta = int(sorted(ds)[len(ds) // 2]) if ds else 0
+    except Exception:
+        pass
+    _eta_cache[workflow] = (time.time(), eta)
+    return eta
 
 
 # ── runner watcher ────────────────────────────────────────────────────────────
@@ -635,16 +653,31 @@ def project_section(p, multi):
         holder = next((r for r in p["runs"] if r["status"] == "in_progress"), None)
         for r in p["runs"]:
             busy = r["status"] == "in_progress"
-            left = ""
-            if busy and p["eta"]:
-                rem = p["eta"] - r["mins"]
-                pct = min(100, int(100 * r["mins"] / p["eta"])) if p["eta"] else 0
-                left = (f'~{rem}m<span class="bar"><i style="width:{pct}%"></i></span>'
-                        if rem > 0 else "að klárast")
-            elif not busy:
+            left, row_style = "", ""
+            if busy:
+                # The ROW is the progress bar: a translucent fill sweeps left to
+                # right as elapsed/ETA grows, so progress is visible at a glance
+                # without a separate widget. Past the ETA the tint turns amber
+                # and says by how much — an overdue run must look overdue, not
+                # sit at 99% forever (that is how two timeout-killed releases
+                # went unnoticed).
+                eta = r.get("eta") or p["eta"]
+                if eta:
+                    pct = min(100, int(100 * r["mins"] / eta))
+                    over = r["mins"] - eta
+                    if over <= 0:
+                        left = f"~{eta - r['mins']}m eftir"
+                        row_style = (f' style="background:linear-gradient(90deg,'
+                                     f'rgba(55,71,143,.13) {pct}%,transparent {pct}%)"')
+                    else:
+                        left = f"+{over}m yfir áætlun"
+                        row_style = ' style="background:rgba(154,99,0,.12)"'
+                else:
+                    left = "keyrir"
+            else:
                 left = (f'bíður eftir keyrara — {html.escape(holder["name"])} heldur honum'
                         if holder else "bíður eftir keyrara")
-            s.append(f'<tr><td>{pill("keyrir" if busy else "bíður", "busy" if busy else "idle")}</td>'
+            s.append(f'<tr{row_style}><td>{pill("keyrir" if busy else "bíður", "busy" if busy else "idle")}</td>'
                      f'<td>{html.escape(r["name"])}</td>'
                      f'<td class="muted">{html.escape(r["title"])}</td>'
                      f'<td class="mono">{r["mins"]}m</td><td class="mono">{left}</td></tr>')
