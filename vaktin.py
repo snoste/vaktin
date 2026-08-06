@@ -535,6 +535,10 @@ def project_section(p, multi):
     if p["runs"]:
         s.append("<table><tr><th>Staða</th><th>Verk</th><th>Hvað</th>"
                  "<th>Tími</th><th>Áætlað eftir</th></tr>")
+        # One self-hosted runner ⇒ one job at a time. A queued run is therefore
+        # always waiting for THE RUNNER, and the thing holding it is whichever
+        # run is in_progress — so say that, instead of a bare "bíður".
+        holder = next((r for r in p["runs"] if r["status"] == "in_progress"), None)
         for r in p["runs"]:
             busy = r["status"] == "in_progress"
             left = ""
@@ -543,6 +547,9 @@ def project_section(p, multi):
                 pct = min(100, int(100 * r["mins"] / p["eta"])) if p["eta"] else 0
                 left = (f'~{rem}m<span class="bar"><i style="width:{pct}%"></i></span>'
                         if rem > 0 else "að klárast")
+            elif not busy:
+                left = (f'bíður eftir keyrara — {html.escape(holder["name"])} heldur honum'
+                        if holder else "bíður eftir keyrara (mac-mini)")
             s.append(f'<tr><td>{pill("keyrir" if busy else "bíður", "busy" if busy else "idle")}</td>'
                      f'<td>{html.escape(r["name"])}</td>'
                      f'<td class="muted">{html.escape(r["title"])}</td>'
