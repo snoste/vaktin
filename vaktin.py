@@ -38,11 +38,13 @@ subjects, session names and release history. On a private network or a VPN
 (Tailscale, WireGuard) that is usually what you want. Do not put it on a public
 interface. See the README.
 """
+import glob
 import html
 import json
 import os
 import re
 import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -331,10 +333,9 @@ def classify_miss(tag, runs, cfg):
 def release_titles(root):
     """version → human title, read from RELEASE.md's own headings.
 
-    Snorri (2026-08-06): the tag list said WHAT was building but never what it
-    WAS — "v5.9.15" is a number, "Stillingaafrit: vélin í einni skrá" is an
-    answer. The titles already exist as the release-notes headings
-    (`# Bláberg Edge Node vX.Y.Z — Title`), so read them instead of inventing
+    The tag list said WHAT was building but never what it WAS — a version
+    number is not an answer. The titles already exist as the release-notes
+    headings (`# <Product> vX.Y.Z — Title`), so read them instead of inventing
     a second naming scheme. Fallback per tag: the annotated tag's own subject.
     """
     titles = {}
@@ -448,6 +449,98 @@ def in_flight(root, cfg):
     return runs, eta
 
 
+# ── runner watcher ────────────────────────────────────────────────────────────
+# Why this lives in Vaktin: a self-hosted runner's listener can die silently
+# (seen during a GitHub Actions outage) — GitHub then reports the runner
+# "offline", jobs queue for an hour, and every dashboard shows "waiting" with
+# nothing running. The one machine that can see the dead process is the machine
+# the runner lives on, and Vaktin is already resident there — so it checks each
+# installed runner's listener and REVIVES it via launchd.
+#
+# Guard rails: a revive per runner at most every RUNNER_REVIVE_COOLDOWN, and
+# after RUNNER_GIVE_UP_AFTER consecutive failed revivals it stops trying and
+# shows red — a runner that dies instantly every time needs a human, and a
+# kickstart loop would just hide that.
+
+RUNNER_GLOB = os.path.expanduser("~/actions-runner-*")
+RUNNER_CHECK_SECONDS = int(os.environ.get("VAKTIN_RUNNER_CHECK_SECONDS", "120"))
+RUNNER_REVIVE_COOLDOWN = 600
+RUNNER_GIVE_UP_AFTER = 3
+
+_runners = {"list": [], "events": []}     # updated by the watcher thread
+
+
+def runner_installs():
+    """Auto-discovered runner installs: every ~/actions-runner-*/ with a
+    .service file (the file holds the launchd plist path; its basename is the
+    service label). No config — a new runner install is watched by existing."""
+    out = []
+    for d in sorted(glob.glob(RUNNER_GLOB)):
+        svc = os.path.join(d, ".service")
+        try:
+            with open(svc) as f:
+                plist = f.read().strip()
+        except OSError:
+            continue
+        label = os.path.basename(plist)
+        label = label[:-6] if label.endswith(".plist") else label
+        out.append({"dir": d, "label": label,
+                    "name": os.path.basename(d).replace("actions-runner-", "")})
+    return out
+
+
+def _listener_alive(rdir):
+    return subprocess.run(["pgrep", "-f", os.path.join(rdir, "bin", "Runner.Listener")],
+                          capture_output=True).returncode == 0
+
+
+def _revive(label):
+    return subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+        capture_output=True, text=True)
+
+
+def runner_watch_loop():
+    fails = {}                       # label → {count, last_attempt}
+    while True:
+        rows = []
+        for r in runner_installs():
+            alive = _listener_alive(r["dir"])
+            f = fails.setdefault(r["label"], {"count": 0, "last": 0.0})
+            state = "ok"
+            if alive:
+                f["count"] = 0
+            elif f["count"] >= RUNNER_GIVE_UP_AFTER:
+                state = "gafst-upp"
+            elif time.time() - f["last"] >= RUNNER_REVIVE_COOLDOWN or f["count"] == 0:
+                f["last"] = time.time()
+                f["count"] += 1
+                res = _revive(r["label"])
+                revived = res.returncode == 0 and _wait_alive(r["dir"])
+                state = "endurræstur" if revived else "endurræsing-mistókst"
+                if revived:
+                    f["count"] = 0
+                _runners["events"].insert(0, {
+                    "ts": time.strftime("%H:%M:%S"), "runner": r["name"],
+                    "action": ("endurræsti keyrarann" if revived
+                               else f"endurræsing mistókst ({f['count']}/{RUNNER_GIVE_UP_AFTER})")})
+                del _runners["events"][20:]
+            else:
+                state = "dauður-bíð"
+            rows.append({"name": r["name"], "label": r["label"],
+                         "alive": alive or state == "endurræstur", "state": state})
+        _runners["list"] = rows
+        time.sleep(RUNNER_CHECK_SECONDS)
+
+
+def _wait_alive(rdir, tries=10):
+    for _ in range(tries):
+        time.sleep(1)
+        if _listener_alive(rdir):
+            return True
+    return False
+
+
 _cache = {"at": 0, "data": None}
 
 
@@ -467,6 +560,7 @@ def gather():
             "note": cfg.get("note", ""),
         })
     data = {"projects": projects, "sessions": sessions(roots),
+            "runners": _runners,
             "configured": bool(roots), "at": time.strftime("%H:%M:%S")}
     _cache.update(at=time.time(), data=data)
     return data
@@ -549,7 +643,7 @@ def project_section(p, multi):
                         if rem > 0 else "að klárast")
             elif not busy:
                 left = (f'bíður eftir keyrara — {html.escape(holder["name"])} heldur honum'
-                        if holder else "bíður eftir keyrara (mac-mini)")
+                        if holder else "bíður eftir keyrara")
             s.append(f'<tr><td>{pill("keyrir" if busy else "bíður", "busy" if busy else "idle")}</td>'
                      f'<td>{html.escape(r["name"])}</td>'
                      f'<td class="muted">{html.escape(r["title"])}</td>'
@@ -620,6 +714,25 @@ def page(d):
                  '</div></div></div>')
         return "".join(s)
 
+    # CI runners on THIS machine — watched and self-healed (see runner_watch_loop)
+    rn = d.get("runners") or {}
+    if rn.get("list"):
+        s.append('<div class="card"><table><tr><th>Keyrari</th><th>Staða</th><th></th></tr>')
+        for r in rn["list"]:
+            if r["alive"]:
+                kind, label, note = "ok", "á lífi", ""
+            elif r["state"] == "gafst-upp":
+                kind, label = "bad", "DAUÐUR"
+                note = "endurræsing mistókst ítrekað — þarf handafl"
+            else:
+                kind, label, note = "warn", "dauður", "reyni endurræsingu sjálfkrafa"
+            s.append(f'<tr><td class="mono">{html.escape(r["name"])}</td>'
+                     f'<td>{pill(label, kind)}</td><td class="muted">{html.escape(note)}</td></tr>')
+        for e in rn.get("events", [])[:5]:
+            s.append(f'<tr><td class="mono muted">{e["ts"]}</td>'
+                     f'<td colspan=2 class="muted">{html.escape(e["runner"])}: {html.escape(e["action"])}</td></tr>')
+        s.append("</table></div>")
+
     multi = len(d["projects"]) > 1
     for p in d["projects"]:
         s.append(project_section(p, multi))
@@ -673,4 +786,7 @@ if __name__ == "__main__":
     print(f"Vaktin → http://localhost:{PORT}   (Ctrl-C to stop)")
     for r in repo_list():
         print(f"  watching {r}")
+    for r in runner_installs():
+        print(f"  watching runner {r['name']} ({r['label']})")
+    threading.Thread(target=runner_watch_loop, daemon=True).start()
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
