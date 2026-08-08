@@ -69,6 +69,10 @@ starts at login and comes back if it dies. `./install.sh status`, `logs`,
 
 ## Configuration lives in the watched repo, not here
 
+**Vaktin is a public repository. It watches private ones.** That asymmetry is
+the whole reason the config lives where it does, and it is a rule to keep rather
+than a fact to note — see [What never goes in this repository](#what-never-goes-in-this-repository).
+
 Vaktin itself is configured with nothing. Each repository carries its own
 `.vaktin.json`, so this tool stays generic and every project's specifics live in
 the project that owns them — which also keeps private identifiers out of a
@@ -161,6 +165,52 @@ hostname in front of it if you want that.
 
 Do not expose it on a public interface. If you need to, put an authenticating
 proxy in front — that is deliberately not this tool's job.
+
+## What never goes in this repository
+
+Vaktin is public and it is developed on the same machine as the private
+repositories it watches. Nothing here is secret, and that is a property to
+maintain deliberately, because every convenience pulls the other way: the
+watched clones sit in `repos/`, a real `.vaktin.json` sits one directory away,
+and `git add -A` does not know the difference. It has gone wrong once already —
+see the note at the end of this section.
+
+**Never commit here:**
+
+- **Identifiers from a watched project** — fleet slugs, GCP project ids, service
+  names, image paths, workflow names, repository or host names. They belong in
+  that project's own `.vaktin.json`. Examples in this repo use
+  `my-service` / `myorg/my-fleet` / `my-gcp-project`, and new ones should too.
+- **A real `.vaktin.json`.** It is in `.gitignore`; keep it there.
+- **Watched clones.** `repos/` is ignored for the same reason — `git add -A`
+  will otherwise commit a *gitlink*, which is a directory name plus a commit sha
+  from someone else's, usually private, repository.
+- **Anything from `/api` output or a screenshot of the page** — branch names,
+  commit subjects, session names and release history are exactly the internal
+  detail the Security section above says to keep off the internet. A bug report
+  needs the shape of the data, not your data; redact before pasting.
+- **Credentials of any kind.** Vaktin has no credential handling and should
+  never grow any: it shells out to `git`, `gh`, `balena` and `gcloud` and
+  borrows whatever those are already authenticated as. No tokens, no key files,
+  no service-account JSON, not even in an example.
+- **Real internal hostnames or tailnet addresses**, including in log excerpts —
+  the page is reached over a private network and that address describes it.
+
+**Before pushing**, the check is one command — it should print nothing:
+
+```bash
+git diff --cached | grep -niE 'your-org|your-fleet|your-gcp-project|internal-host'
+```
+
+Substitute your own identifiers. Keep the list in your shell history, not in
+this file: a repository that names the things it must not name has not solved
+the problem.
+
+The `repos/` rule in `.gitignore` is not hypothetical — it was written after a
+`git add -A` committed exactly that gitlink, early in this repository's life.
+It was removed the same day, but a git history is not a place things leave, so
+the rule matters more than the cleanup did. Assume the same about anything you
+commit here.
 
 ## Licence
 

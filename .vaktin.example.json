@@ -1,5 +1,9 @@
 {
-  "_comment": "Copy to .vaktin.json in the ROOT of a repository you want Vaktin to watch. Every key is optional; a repo with no config still gets branches and tags. Config lives here, in the project that owns these facts, so the tool stays generic and private identifiers never reach it.",
+  "_comment": "Copy to .vaktin.json in the ROOT of a repository you want Vaktin to watch. Every key is optional; a repo with no config still gets branches and tags. Config lives there, in the project that owns these facts, so the tool stays generic and private identifiers never reach it — Vaktin's own repository is PUBLIC and the ones it watches usually are not.",
+
+  "_this_file_is_the_example": "Every value below is a placeholder and must stay one. A real fleet slug, GCP project id, service name or image path committed here is public. `.vaktin.json` is in Vaktin's .gitignore for that reason; do not remove it, and do not 'fix' this example by filling in your own values.",
+
+  "_your_copy_is_as_public_as_its_repo": "The file you write from this carries a deploy target's identifiers, so it is exactly as exposed as the repository you put it in. That is fine in a private repo and a decision worth making on purpose in a public one — none of these values is a credential, but together they name your infrastructure.",
 
   "name": "my-service",
 

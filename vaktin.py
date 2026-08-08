@@ -18,8 +18,13 @@ hanging the page, because a status page that hangs is worse than no status page.
 ── Configuration ────────────────────────────────────────────────────────────
 Vaktin itself is configured with nothing. Each repository it watches carries its
 own `.vaktin.json`, so the tool stays generic and every project's specifics
-(fleet slugs, workflow names) live in the project that owns them — which also
-keeps them out of this repository.
+(fleet slugs, GCP project ids, workflow names) live in the project that owns
+them — which also keeps them out of this repository.
+
+That second half is a rule, not a side effect: THIS REPOSITORY IS PUBLIC AND THE
+ONES IT WATCHES ARE NOT. No identifier from a watched project belongs in this
+file or any other file here — examples use `my-service`, `myorg/my-fleet`,
+`my-gcp-project`. See "What never goes in this repository" in the README.
 
 Point it at repositories one of two ways:
 
