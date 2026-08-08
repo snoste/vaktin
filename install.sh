@@ -27,8 +27,11 @@ PY="${PY:-/usr/bin/python3}"
 
 # launchd gives an agent a minimal PATH. gh and balena live in Homebrew's bin on
 # both Apple Silicon and Intel, so both are included and the missing one is
-# simply never found.
-AGENT_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# simply never found. gcloud is the exception: its own installer puts it under
+# $HOME, not in a bin directory anyone's PATH already has — and a missing CLI
+# degrades that panel to "unknown" silently, which reads exactly like a target
+# that is genuinely unreachable. Include it so Cloud Run answers at all.
+AGENT_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/google-cloud-sdk/bin"
 
 case "${1:-}" in
 install)

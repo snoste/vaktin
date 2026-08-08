@@ -137,10 +137,16 @@ The JSON is the same structure the page renders: `projects[]` each with
 ## Requirements
 
 `git` always. `gh` ([GitHub CLI](https://cli.github.com/), authenticated) for CI
-state. `balena` for the build join. Each is optional — a missing or unauthenticated
-CLI degrades that panel to "unknown" and never takes the page down. Every
-subprocess runs under a timeout for the same reason: a status page that hangs is
-worse than no status page.
+state. `balena` or `gcloud` (authenticated) for the build join, whichever your
+project deploys with. Each is optional — a missing or unauthenticated CLI
+degrades that panel to "unknown" and never takes the page down. Every subprocess
+runs under a timeout for the same reason: a status page that hangs is worse than
+no status page.
+
+If you run it under `launchd`, note that an agent gets a minimal PATH: `gcloud`
+installs under `$HOME` rather than into any standard bin directory, so
+`install.sh` adds `$HOME/google-cloud-sdk/bin` explicitly. Without it the panel
+reads "unknown" — indistinguishable from a target that is genuinely down.
 
 ## Security
 
