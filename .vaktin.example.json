@@ -3,8 +3,16 @@
 
   "name": "my-service",
 
-  "_fleet": "Deploy target to join tags against, so Vaktin can answer 'was this tag ACTUALLY built?'. balenaCloud slug today. Omit and tags are listed without build state.",
+  "_fleet": "Deploy target to join tags against, so Vaktin can answer 'was this tag ACTUALLY built?'. balenaCloud slug. Omit both this and cloud_run, and tags are listed without build state.",
   "fleet": "myorg/my-fleet",
+
+  "_cloud_run": "The other deploy target: Google Cloud Run. Use INSTEAD of `fleet`. Cloud Run knows container digests and nothing about your version numbers, so the join runs through git — it requires that CI tag the image with the commit sha it built (`--tag $IMAGE:${{ github.sha }}`), which is what makes tag → sha → digest → revision resolvable. Needs an authenticated `gcloud`; without one this panel degrades to 'unknown' like any other unreachable target. A version whose image exists but has NO revision on it reads as `drög` — the build succeeded and the deploy did not — while a superseded revision reads as shipped, because it did ship.",
+  "cloud_run": {
+    "service": "my-service",
+    "region": "europe-west1",
+    "project": "my-gcp-project",
+    "image": "gcr.io/my-gcp-project/my-service"
+  },
 
   "_deploy_workflow": "GitHub Actions workflow NAME (not filename) for the deploy. Used for the ETA median over your last five successful runs, and to find the run behind a tag that never built.",
   "deploy_workflow": "Deploy to Production",

@@ -32,6 +32,10 @@ or list one absolute path per line in:
 A repo with no `.vaktin.json` still works — you get branches and tags, just no
 build/ship join. See `.vaktin.example.json` for the schema.
 
+Deploy targets: balenaCloud (`fleet`) and Cloud Run (`cloud_run`). Both plug
+into one seam, `built_map()`, which returns `{version: (status, is_final)}` —
+adding a third target means implementing that and nothing else.
+
 ── A note on exposure ───────────────────────────────────────────────────────
 This binds 0.0.0.0 and has NO authentication. It renders branch names, commit
 subjects, session names and release history. On a private network or a VPN
@@ -178,17 +182,28 @@ def branches(root, cfg):
     return sorted(out, key=lambda x: -x["age"])
 
 
-def built_map(cfg):
+def built_map(root, cfg):
     """What the deploy target actually has, keyed by version.
 
-    Only balena is implemented, because that is what the first user deploys to.
-    A repo with no `fleet` simply skips the join and still gets its tag list —
-    which is why this returns (map, reachable) rather than raising.
+    The seam every deploy target plugs into: return `{version: (status,
+    is_final)}` plus whether the target was reachable at all. A third element
+    may carry a per-version note, which is how a target says something the two
+    flags cannot — Cloud Run uses it to mark the revision serving traffic.
+
+    (map, reachable) rather than raising, because the three answers are
+    genuinely different and only one is a problem: no target configured
+    (None → skip the join, still list tags), configured but unreachable
+    (False → say "unknown", never "never built"), and configured and answered.
     """
-    fleet = cfg.get("fleet")
-    if not fleet:
-        return {}, None                       # not configured → not an error
-    raw = run(["balena", "release", "list", fleet, "--json"], 40)
+    if cfg.get("fleet"):
+        return _built_balena(cfg)
+    if cfg.get("cloud_run"):
+        return _built_cloud_run(root, cfg)
+    return {}, None                           # not configured → not an error
+
+
+def _built_balena(cfg):
+    raw = run(["balena", "release", "list", cfg["fleet"], "--json"], 40)
     if not raw:
         return {}, False                      # configured but unreachable
     built = {}
@@ -203,6 +218,78 @@ def built_map(cfg):
     return built, True
 
 
+def _built_cloud_run(root, cfg):
+    """Cloud Run's answer to "was this tag actually built?".
+
+    Balena knows versions, so its join is a lookup. Cloud Run knows container
+    DIGESTS and nothing about your version numbers, so the join runs through
+    git: CI tags the image it builds with the commit sha (`…/svc:<sha>`), a git
+    tag names a commit, and a revision names a digest. tag → sha → digest →
+    revision is the whole chain, and every link is a recorded fact rather than
+    an assumption about naming.
+
+    The distinction worth keeping: an image with NO revision standing on it is
+    the Cloud Run shape of balena's draft — the build succeeded and the deploy
+    did not, so the artifact exists and nothing serves it. A superseded revision
+    is NOT that: it shipped, and was later replaced, which is what every healthy
+    old release looks like. Calling those drafts would paint nine green releases
+    amber and teach you to ignore the colour.
+    """
+    c = cfg.get("cloud_run") or {}
+    service, region = c.get("service"), c.get("region")
+    project, image = c.get("project"), c.get("image")
+    if not (service and region and project and image):
+        return {}, None                       # half-configured → same as absent
+
+    revs = run(["gcloud", "run", "revisions", "list", "--service", service,
+                "--region", region, "--project", project,
+                "--format=json", "--limit", "100"], 45)
+    svc = run(["gcloud", "run", "services", "describe", service, "--region", region,
+               "--project", project, "--format=json"], 45)
+    imgs = run(["gcloud", "container", "images", "list-tags", image,
+                "--format=json", "--limit", "200"], 45)
+    if not (revs and svc and imgs):
+        return {}, False                      # unreachable → "unknown", not "never built"
+
+    try:
+        digest_revs = {}                      # digest → revisions standing on it
+        for r in json.loads(revs):
+            img = ((r.get("spec") or {}).get("containers") or [{}])[0].get("image", "")
+            if "@" in img:
+                digest_revs.setdefault(img.split("@")[-1], []).append(
+                    (r.get("metadata") or {}).get("name", ""))
+        live = {t.get("revisionName") for t in
+                (json.loads(svc).get("status") or {}).get("traffic", [])
+                if (t.get("percent") or 0) > 0}
+        sha_digest = {}                       # commit sha (the image tag) → digest
+        for im in json.loads(imgs):
+            for t in im.get("tags", []):
+                if re.fullmatch(r"[0-9a-f]{7,40}", t):
+                    sha_digest[t] = im.get("digest", "")
+    except Exception:
+        return {}, False
+
+    built = {}
+    for tag in run(["git", "tag", "-l", cfg["tag_glob"]], cwd=root).splitlines():
+        sha = run(["git", "rev-parse", f"{tag}^{{commit}}"], cwd=root)
+        if not sha:
+            continue
+        digest = sha_digest.get(sha) or next(
+            (d for s, d in sha_digest.items()
+             if s and (sha.startswith(s) or s.startswith(sha))), "")
+        if not digest:
+            continue                          # no image → absent, i.e. never built
+        sem = tag[1:] if tag[:1] == "v" else tag
+        names = digest_revs.get(digest, [])
+        if not names:
+            built[sem] = ("success", False, "byggð en engin keyrsla stendur á henni")
+        elif live.intersection(names):
+            built[sem] = ("success", True, "í umferð núna")
+        else:
+            built[sem] = ("success", True)
+    return built, True
+
+
 def deploy_runs(root, cfg):
     """The deploy workflow's recent runs, indexed by the tag that triggered them.
 
@@ -212,8 +299,8 @@ def deploy_runs(root, cfg):
     if not wf:
         return {}
     raw = run(["gh", "run", "list", "--workflow", wf, "--limit", "40", "--json",
-               "conclusion,status,displayTitle,startedAt,updatedAt,databaseId,headBranch"],
-              30, root)
+               "conclusion,status,displayTitle,startedAt,updatedAt,databaseId,"
+               "headBranch,headSha"], 30, root)
     idx = {}
     try:
         for r in json.loads(raw or "[]"):
@@ -230,9 +317,17 @@ def deploy_runs(root, cfg):
                 mins = int((b - a) / 60)
             except Exception:
                 pass
-            idx[key] = {"conclusion": r.get("conclusion") or "",
-                        "status": r.get("status") or "",
-                        "mins": mins, "id": r.get("databaseId")}
+            entry = {"conclusion": r.get("conclusion") or "",
+                     "status": r.get("status") or "",
+                     "mins": mins, "id": r.get("databaseId")}
+            idx[key] = entry
+            # Also reachable by commit: a project that deploys on PUSH TO TRUNK
+            # and cuts tags afterwards has every run keyed "main", so a lookup
+            # by tag finds nothing and the diagnosis column is blank forever.
+            # The tag names a commit, and the run records the commit it ran on.
+            sha = (r.get("headSha") or "").strip()
+            if sha:
+                idx.setdefault(sha, entry)
     except Exception:
         pass
     return idx
@@ -359,11 +454,19 @@ def tag_subject(root, tag):
 
 def releases(root, cfg):
     """Tags joined to what was actually built — the join nothing else does."""
-    built, ok = built_map(cfg)
+    built, ok = built_map(root, cfg)
     titles = release_titles(root)
     runs = deploy_runs(root, cfg) if ok is not None else {}
     tags = run(["git", "tag", "-l", cfg["tag_glob"], "--sort=-v:refname"],
                cwd=root).splitlines()[:10]
+
+    # Reach a push-deployed project's runs by tag: deploy_runs indexes those by
+    # commit (see there), and everything below looks up by tag name.
+    for t in tags:
+        if t not in runs:
+            sha = run(["git", "rev-parse", f"{t}^{{commit}}"], cwd=root)
+            if sha and sha in runs:
+                runs[t] = runs[sha]
 
     # Time every cancelled run FIRST, so each one can be told how many of its
     # siblings stopped at the same minute (see classify_miss). A verdict that
@@ -389,7 +492,9 @@ def releases(root, cfg):
         if ok is None:
             state = "unknown"
         elif sem in built:
-            status, final = built[sem]
+            entry = built[sem]
+            status, final = entry[0], entry[1]
+            note = entry[2] if len(entry) > 2 else ""   # optional per-version note
             if status == "success" and final:
                 state = "shipped"
             elif status == "success":
@@ -742,9 +847,10 @@ def project_section(p, multi):
         kind, label, note = "idle", st, ""
         if st == "shipped":
             kind, label = "ok", "komin út"
+            note = r.get("note") or ""      # e.g. Cloud Run's "í umferð núna"
         elif st == "draft":
             kind, label = "warn", "drög"
-            note = "byggð en engin tæki taka hana"
+            note = r.get("note") or "byggð en engin tæki taka hana"
         elif st == "not-built":
             kind, label = "bad", "ALDREI BYGGÐ"
             # The remedy is READ from the run, not assumed: a timeout kill and a
@@ -762,8 +868,9 @@ def project_section(p, multi):
     if p["built_ok"] is False:
         s.append('<div class="hint">Náði ekki í byggingarstöðu — óþekkt.</div>')
     elif p["built_ok"] is None:
-        s.append('<div class="hint">Enginn <code>fleet</code> í '
-                 '<code>.vaktin.json</code> — merki eru sýnd án byggingarstöðu.</div>')
+        s.append('<div class="hint">Ekkert <code>fleet</code> eða '
+                 '<code>cloud_run</code> í <code>.vaktin.json</code> — merki eru '
+                 'sýnd án byggingarstöðu.</div>')
 
     # branches — what has NOT landed
     s.append('<h2>Greinar sem eru ekki komnar á main</h2><div class="card">')

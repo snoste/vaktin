@@ -87,7 +87,8 @@ public repository.
 | key | meaning | default |
 |---|---|---|
 | `name` | shown as the section heading | the directory name |
-| `fleet` | deploy target to join tags against (balena today) | none → tags shown without build state |
+| `fleet` | balena deploy target to join tags against | none → tags shown without build state |
+| `cloud_run` | Cloud Run deploy target — `{service, region, project, image}` | none → as above |
 | `deploy_workflow` | workflow name used for the ETA median | none → no ETA |
 | `trunk` | the branch others are measured against | `main` |
 | `tag_glob` | which tags are releases | `v*` |
@@ -95,10 +96,26 @@ public repository.
 Every key is optional. A repo with no `.vaktin.json` still gets branches and
 tags — you simply lose the build/ship join.
 
-**Deploy targets.** Only [balenaCloud](https://www.balena.io/) is implemented,
-because that is what the first user deploys to. The seam is one function,
-`built_map()`, which returns `{version: (status, is_final)}`. Adding a target
+**Deploy targets.** [balenaCloud](https://www.balena.io/) and
+[Cloud Run](https://cloud.google.com/run). The seam is one function,
+`built_map()`, which returns `{version: (status, is_final)}` — adding a third
 means implementing that and nothing else.
+
+Balena knows versions, so its join is a lookup. Cloud Run knows container
+digests and nothing about your version numbers, so that join runs through git:
+CI tags the image it builds with the commit sha, a git tag names a commit, and
+a revision names a digest — so **tag → sha → digest → revision** is the chain,
+and every link is a recorded fact rather than a naming convention. It therefore
+requires that your workflow build `$IMAGE:${{ github.sha }}`, and an
+authenticated `gcloud`.
+
+One difference is worth stating, because getting it wrong makes the panel
+useless: a Cloud Run image with **no revision standing on it** is the shape
+balena calls a draft — the build succeeded, the deploy did not, nothing serves
+it. A **superseded** revision is not that. It shipped and was later replaced,
+which is what every healthy old release looks like; marking those amber would
+paint nine green releases as warnings and teach you to ignore the colour. The
+revision currently taking traffic is marked `í umferð núna`.
 
 ## For coding agents
 
