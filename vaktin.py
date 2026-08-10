@@ -623,6 +623,28 @@ def runner_installs():
     return out
 
 
+def gh_runners(root):
+    """Self-hosted runners registered to this repo, from the GitHub API — the
+    CROSS-MACHINE truth. The process/launchd view above only sees runners on
+    THIS box (and can only revive those), so a runner on another machine (the
+    Ubuntu server) is invisible to it; this fills that gap. [] on any error, so
+    a repo with no runners or no `gh` auth just shows nothing."""
+    nwo = run(["gh", "repo", "view", "--json", "nameWithOwner",
+               "-q", ".nameWithOwner"], cwd=root)
+    if not nwo:
+        return []
+    out = run(["gh", "api", f"repos/{nwo}/actions/runners", "--paginate",
+               "-q", r'.runners[] | "\(.name)\t\(.status)\t\(.busy)\t'
+                     r'\([.labels[].name] | join(","))"'], cwd=root)
+    rows = []
+    for line in (out or "").splitlines():
+        p = line.split("\t")
+        if len(p) == 4:
+            rows.append({"name": p[0], "online": p[1] == "online",
+                         "busy": p[2] == "true", "labels": p[3]})
+    return rows
+
+
 def _listener_alive(rdir):
     return subprocess.run(["pgrep", "-f", os.path.join(rdir, "bin", "Runner.Listener")],
                           capture_output=True).returncode == 0
@@ -729,10 +751,17 @@ def gather():
         return _cache["data"]
     roots = repo_list()
     projects = []
+    gh_runner_rows, seen_runners = [], set()
     for root in roots:
         cfg = repo_config(root)
         rel, ok = releases(root, cfg)
         runs, eta = in_flight(root, cfg)
+        # Registered self-hosted runners (deduped across repos — one physical
+        # runner can serve several). This is what surfaces the Ubuntu server.
+        for r in gh_runners(root):
+            if r["name"] not in seen_runners:
+                seen_runners.add(r["name"])
+                gh_runner_rows.append(r)
         projects.append({
             "name": cfg["name"], "root": root,
             "branches": branches(root, cfg), "releases": rel,
@@ -740,7 +769,7 @@ def gather():
             "note": cfg.get("note", ""),
         })
     data = {"projects": projects, "sessions": sessions(roots),
-            "runners": _runners,
+            "runners": _runners, "github_runners": gh_runner_rows,
             "configured": bool(roots), "at": time.strftime("%H:%M:%S")}
     _cache.update(at=time.time(), data=data)
     return data
@@ -1004,6 +1033,24 @@ def page(d):
                  '(ein á línu) eða <code>VAKTIN_REPOS=/slóð/a:/slóð/b</code>.'
                  '</div></div></div>')
         return "".join(s)
+
+    # Registered runners across ALL machines — GitHub's own view (online/busy),
+    # so the Ubuntu server shows here even though the self-heal below is mac-only.
+    ghr = d.get("github_runners") or []
+    if ghr:
+        s.append('<div class="card"><table class="stack"><tr class="hd">'
+                 "<th>Keyrari (GitHub)</th><th>Staða</th><th></th></tr>")
+        for r in ghr:
+            if not r["online"]:
+                kind, label = "bad", "aftengdur"
+            elif r["busy"]:
+                kind, label = "warn", "að vinna"
+            else:
+                kind, label = "ok", "laus"
+            s.append(f'<tr><td class="c-run mono">{clip(r["name"], 1)}</td>'
+                     f'<td class="c-rstate">{pill(label, kind)}</td>'
+                     f'<td class="c-rnote muted">{clip(r.get("labels",""), 1)}</td></tr>')
+        s.append("</table></div>")
 
     # CI runners on THIS machine — watched and self-healed (see runner_watch_loop)
     rn = d.get("runners") or {}
