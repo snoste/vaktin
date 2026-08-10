@@ -578,15 +578,18 @@ def in_flight(root, cfg):
         for r in json.loads(raw or "[]"):
             if r["status"] in ("in_progress", "queued", "pending", "waiting"):
                 started = r.get("startedAt") or ""
-                mins = 0
+                mins, secs = 0, 0
                 if started:
                     try:
                         t = time.mktime(time.strptime(started, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
-                        mins = max(0, int((time.time() - t) / 60))
+                        secs = max(0, int(time.time() - t))
+                        mins = secs // 60
                     except Exception:
                         pass
+                # seconds as well as minutes: the page counts down in real time
+                # between refreshes, and a whole minute is a coarse tick
                 runs.append({"status": r["status"], "name": r["name"],
-                             "title": r["displayTitle"], "mins": mins,
+                             "title": r["displayTitle"], "mins": mins, "secs": secs,
                              "ref": r.get("headBranch") or "",
                              "id": r["databaseId"]})
     except Exception:
@@ -854,6 +857,8 @@ tr:last-child td{border-bottom:none}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;background:var(--busy)}
 .dot.off{background:var(--muted);opacity:.45}
 .ref-tag{color:var(--accent);font-weight:600}
+/* a ticking clock must not jiggle as digits change width */
+.c-time,.c-eta{font-variant-numeric:tabular-nums}
 /* The row IS the progress bar: the fill sweeps left to right as elapsed/ETA grows. */
 tr.prog{background:linear-gradient(90deg,rgba(55,71,143,.13) var(--pct),transparent var(--pct))}
 tr.over{background:rgba(154,99,0,.12)}
@@ -951,6 +956,43 @@ def pill(text, kind):
     return f'<span class="pill p-{kind}">{html.escape(text)}</span>'
 
 
+# Three jobs, in one place beside CSS so a page rendered outside the request
+# handler (a preview, a test) is the same page a browser gets:
+#
+#  1. tap a clamped subject to see all of it — delegated, so it survives the
+#     content swap in (3) replacing every row;
+#  2. tick the clocks once a second, so an estimate is a running countdown
+#     rather than a number that only moves when the page happens to refresh.
+#     Each cell carries the seconds it had at render and counts from when the
+#     browser first saw it, so a browser clock that disagrees with this
+#     machine's changes nothing — and the swap re-baselines it every 20 s;
+#  3. swap the content in place instead of <meta refresh>: a full reload throws
+#     you back to the top every 20 s, which makes everything below the fold
+#     unreadable — the sections you scrolled down to see.
+JS = ("<script>document.addEventListener('click',e=>{"
+      "const c=e.target.closest('.clip');if(c)c.classList.toggle('open');});"
+      "const _f=s=>{s=Math.max(0,Math.round(s));"
+      "const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60,p=n=>String(n).padStart(2,'0');"
+      "return h?h+':'+p(m)+':'+p(x):m+':'+p(x)};"
+      "const _el=e=>{if(!e.dataset.t0)e.dataset.t0=Date.now();"
+      "return (Date.now()-e.dataset.t0)/1000};"
+      "setInterval(()=>{"
+      "document.querySelectorAll('[data-elapsed]').forEach(e=>{"
+      "e.textContent=_f(+e.dataset.elapsed+_el(e));});"
+      "document.querySelectorAll('[data-left]').forEach(e=>{"
+      "const left=+e.dataset.left-_el(e),tot=+e.dataset.total||0,row=e.closest('tr');"
+      "e.textContent=left>0?'~'+_f(left)+' eftir':'+'+_f(-left)+' yfir áætlun';"
+      "if(row&&tot){if(left>0){row.classList.add('prog');row.classList.remove('over');"
+      "row.style.setProperty('--pct',Math.min(100,100*(tot-left)/tot).toFixed(1)+'%');}"
+      "else{row.classList.remove('prog');row.classList.add('over');}}});"
+      "},1000);"
+      "setInterval(async()=>{"
+      "try{const r=await fetch('/',{cache:'no-store'});"
+      "const d=new DOMParser().parseFromString(await r.text(),'text/html');"
+      "const n=d.querySelector('.wrap'),o=document.querySelector('.wrap');"
+      "if(n&&o)o.innerHTML=n.innerHTML;}catch(e){}},20000);</script>")
+
+
 def clock(ts):
     """Wall-clock time, dated only when it is not today — a bare 13:43 on a
     session that started yesterday is a lie you read twice."""
@@ -996,7 +1038,7 @@ def project_section(p, multi):
         holder = next((r for r in p["runs"] if r["status"] == "in_progress"), None)
         for r in p["runs"]:
             busy = r["status"] == "in_progress"
-            left, row_style = "", ""
+            left, row_style, tick = "", "", ""
             if busy:
                 # The ROW is the progress bar: a translucent fill sweeps left to
                 # right as elapsed/ETA grows, so progress is visible at a glance
@@ -1008,6 +1050,12 @@ def project_section(p, multi):
                 if eta:
                     pct = min(100, int(100 * r["mins"] / eta))
                     over = r["mins"] - eta
+                    # The estimate counts down live rather than sitting still for
+                    # 20 s at a time: the row carries the numbers and the client
+                    # ticks them, so nothing here depends on the browser's clock
+                    # agreeing with this machine's.
+                    tick = (f' data-left="{eta * 60 - r["secs"]}"'
+                            f' data-total="{eta * 60}"')
                     # the percentage travels as a custom property, not a finished
                     # gradient, so the phone can draw it as a bar instead (CSS)
                     if over <= 0:
@@ -1033,8 +1081,9 @@ def project_section(p, multi):
                      f'<td class="c-job">{clip(r["name"], 1)}</td>'
                      f'<td class="{rcls}">{clip(ref, 1) if ref else ""}</td>'
                      f'<td class="c-what muted">{clip(r["title"])}</td>'
-                     f'<td class="c-time mono">{r["mins"]}m</td>'
-                     f'<td class="c-eta mono">{left}</td></tr>')
+                     f'<td class="c-time mono" data-elapsed="{r["secs"]}">'
+                     f'{r["mins"]}m</td>'
+                     f'<td class="c-eta mono"{tick}>{left}</td></tr>')
         s.append("</table>")
     else:
         s.append('<div class="empty">Ekkert í gangi.</div>')
@@ -1180,22 +1229,10 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(gather(), ensure_ascii=False).encode()
             ctype = "application/json; charset=utf-8"
         else:
-            # Swap the content in place instead of <meta refresh>: a full reload
-            # throws you back to the top every 20 s, which makes everything below
-            # the fold unreadable — the sections you scrolled down to see.
-            # Delegated, so it survives the content swap below replacing every row.
-            # A tap on a clamped subject shows all of it; a second tap folds it.
-            js = ("<script>document.addEventListener('click',e=>{"
-                  "const c=e.target.closest('.clip');if(c)c.classList.toggle('open');});"
-                  "setInterval(async()=>{"
-                  "try{const r=await fetch('/',{cache:'no-store'});"
-                  "const d=new DOMParser().parseFromString(await r.text(),'text/html');"
-                  "const n=d.querySelector('.wrap'),o=document.querySelector('.wrap');"
-                  "if(n&&o)o.innerHTML=n.innerHTML;}catch(e){}},20000);</script>")
             body = (f"<!doctype html><meta charset=utf-8>"
                     f"<meta name=viewport content='width=device-width,initial-scale=1'>"
                     f"<title>Vaktin</title>"
-                    f"<style>{CSS}</style>{page(gather())}{js}").encode()
+                    f"<style>{CSS}</style>{page(gather())}{JS}").encode()
             ctype = "text/html; charset=utf-8"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
