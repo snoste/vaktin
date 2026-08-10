@@ -523,7 +523,10 @@ def releases(root, cfg):
 
 def in_flight(root, cfg):
     """What CI is doing right now, plus an honest ETA from recent history."""
-    fields = "status,name,displayTitle,startedAt,databaseId"
+    # headBranch is the REF the run is for, and for a tag push that is the tag
+    # itself (v1.4.2) — which is the only place the version being built appears.
+    # Without it a release build is indistinguishable from any other CI run.
+    fields = "status,name,displayTitle,startedAt,databaseId,headBranch"
     raw = run(["gh", "run", "list", "--limit", "15", "--json", fields], 30, root)
     runs = []
     try:
@@ -539,6 +542,7 @@ def in_flight(root, cfg):
                         pass
                 runs.append({"status": r["status"], "name": r["name"],
                              "title": r["displayTitle"], "mins": mins,
+                             "ref": r.get("headBranch") or "",
                              "id": r["databaseId"]})
     except Exception:
         pass
@@ -774,6 +778,7 @@ tr:last-child td{border-bottom:none}
 .p-busy{background:#e8ebf7;color:var(--busy)}
 .p-idle{background:#eef0f5;color:var(--muted)}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;background:var(--busy)}
+.ref-tag{color:var(--accent);font-weight:600}
 /* The row IS the progress bar: the fill sweeps left to right as elapsed/ETA grows. */
 tr.prog{background:linear-gradient(90deg,rgba(55,71,143,.13) var(--pct),transparent var(--pct))}
 tr.over{background:rgba(154,99,0,.12)}
@@ -823,7 +828,12 @@ code{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;
  .c-status{grid-row:1;grid-column:1}
  .c-job{grid-row:1;grid-column:2}
  .c-time{grid-row:1;grid-column:3;justify-self:end}
- .c-what{grid-row:2;grid-column:1/-1}
+ /* the ref shares line two with the subject rather than costing a line of its
+    own — "which version is building" is the question the panel exists for */
+ /* capped: a grid column is shared by every row, so one long branch name would
+    otherwise widen column one and shove the job names of all the others right */
+ .c-ref{grid-row:2;grid-column:1;max-width:34vw}
+ .c-what{grid-row:2;grid-column:2/-1}
  .c-eta{grid-row:3;grid-column:1/-1}
  .c-tag{grid-row:1;grid-column:1}
  .c-state{grid-row:1;grid-column:2;justify-self:start}
@@ -877,7 +887,8 @@ def project_section(p, multi):
     # in flight first — it is the thing you are waiting on
     s.append('<h2>Í vinnslu núna</h2><div class="card">')
     if p["runs"]:
-        s.append('<table class="stack"><tr class="hd"><th>Staða</th><th>Verk</th><th>Hvað</th>'
+        s.append('<table class="stack"><tr class="hd"><th>Staða</th><th>Verk</th>'
+                 "<th>Merki/grein</th><th>Hvað</th>"
                  "<th>Tími</th><th>Áætlað eftir</th></tr>")
         # One self-hosted runner ⇒ one job at a time. A queued run is therefore
         # always waiting for THE RUNNER, and the thing holding it is whichever
@@ -910,9 +921,17 @@ def project_section(p, multi):
             else:
                 left = (f'bíður eftir keyrara — {html.escape(holder["name"])} heldur honum'
                         if holder else "bíður eftir keyrara")
+            # A tag reads as the version being built and is highlighted as one;
+            # a branch name is context, so it stays muted.
+            ref, rcls = r.get("ref") or "", "c-ref mono"
+            if re.match(r"^v?\d+\.\d+", ref):
+                rcls += " ref-tag"
+            else:
+                rcls += " muted"
             s.append(f'<tr{row_style}><td class="c-status">'
                      f'{pill("keyrir" if busy else "bíður", "busy" if busy else "idle")}</td>'
                      f'<td class="c-job">{clip(r["name"], 1)}</td>'
+                     f'<td class="{rcls}">{clip(ref, 1) if ref else ""}</td>'
                      f'<td class="c-what muted">{clip(r["title"])}</td>'
                      f'<td class="c-time mono">{r["mins"]}m</td>'
                      f'<td class="c-eta mono">{left}</td></tr>')
