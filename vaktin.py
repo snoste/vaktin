@@ -181,7 +181,9 @@ def branches(root, cfg):
             "name": br,
             "ahead": ahead,
             "when": run(["git", "log", "-1", "--format=%cr", br], cwd=root),
-            "subject": run(["git", "log", "-1", "--format=%s", br], cwd=root)[:70],
+            # not cut here: the cell clamps it and hands the whole line back on a
+            # tap, so a hard truncation would only throw away what the tap reveals
+            "subject": run(["git", "log", "-1", "--format=%s", br], cwd=root),
             "age": int(run(["git", "log", "-1", "--format=%ct", br], cwd=root) or 0),
         })
     return sorted(out, key=lambda x: -x["age"])
@@ -536,7 +538,7 @@ def in_flight(root, cfg):
                     except Exception:
                         pass
                 runs.append({"status": r["status"], "name": r["name"],
-                             "title": r["displayTitle"][:60], "mins": mins,
+                             "title": r["displayTitle"], "mins": mins,
                              "id": r["databaseId"]})
     except Exception:
         pass
@@ -772,6 +774,9 @@ tr:last-child td{border-bottom:none}
 .p-busy{background:#e8ebf7;color:var(--busy)}
 .p-idle{background:#eef0f5;color:var(--muted)}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;background:var(--busy)}
+/* The row IS the progress bar: the fill sweeps left to right as elapsed/ETA grows. */
+tr.prog{background:linear-gradient(90deg,rgba(55,71,143,.13) var(--pct),transparent var(--pct))}
+tr.over{background:rgba(154,99,0,.12)}
 .empty{padding:16px 14px;color:var(--muted)}
 .hint{margin-top:8px;font-size:12px;color:var(--muted)}
 .bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden;width:120px;display:inline-block;
@@ -779,6 +784,70 @@ tr:last-child td{border-bottom:none}
 .bar i{display:block;height:100%;background:var(--accent)}
 code{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;
      background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px}
+/* A commit subject is one line of interest and five lines of height. Clamp it,
+   and let hover (title=) or a tap give the whole thing back. */
+.clip{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+      overflow-wrap:anywhere}
+/* Chrome clamps block containers too now, so un-clamping needs the property reset
+   as well as the display change — dropping to block alone leaves it clipped. */
+.clip:focus,.clip:active,.clip.open{display:block;-webkit-line-clamp:initial;overflow:visible;
+                                    outline:none}
+
+/* Phones. 720 rather than 640 because in between the five-column table survives
+   only by squeezing the job name to an ellipsis, which is what you scan for. */
+@media (max-width:720px){
+ body{font-size:13px}
+ .wrap{padding:14px 12px 40px}
+ header{flex-wrap:wrap;gap:6px;margin-bottom:14px}
+ h1{font-size:17px}
+ h2{margin:18px 0 8px}
+ h3{margin:24px 0 4px;font-size:14px}
+ h3 .root{display:block;margin-left:0;overflow-wrap:anywhere}
+ td,th{padding:7px 10px}
+ .pill{padding:1px 7px;font-size:10.5px}
+ .mono{font-size:11.5px;overflow-wrap:anywhere}
+ .empty,.hint{font-size:12px}
+ /* one line for names and branches — but only here: on a wide screen the column
+    has room to wrap them, and clamping there would hide a name for no gain */
+ .clip1{-webkit-line-clamp:1}
+ /* Five columns do not fit a phone, and the horizontal scroll that follows hides
+    the very column you opened the page for — how long is left. So each row stops
+    being a row: the facts you scan on line one, the prose underneath. */
+ table.stack,table.stack tbody,table.stack tr,table.stack td{display:block}
+ table.stack .hd{display:none}
+ table.stack tr{display:grid;grid-template-columns:auto 1fr auto;align-items:center;
+                column-gap:8px;row-gap:3px;padding:8px 10px;border-bottom:1px solid var(--line)}
+ table.stack tr:last-child{border-bottom:none}
+ table.stack td{padding:0;border:none;min-width:0}
+ table.stack td:empty{display:none}
+ .c-status{grid-row:1;grid-column:1}
+ .c-job{grid-row:1;grid-column:2}
+ .c-time{grid-row:1;grid-column:3;justify-self:end}
+ .c-what{grid-row:2;grid-column:1/-1}
+ .c-eta{grid-row:3;grid-column:1/-1}
+ .c-tag{grid-row:1;grid-column:1}
+ .c-state{grid-row:1;grid-column:2;justify-self:start}
+ .c-rtitle{grid-row:2;grid-column:1/-1}
+ .c-note{grid-row:3;grid-column:1/-1}
+ .c-branch{grid-row:1;grid-column:1/3}
+ .c-ahead{grid-row:1;grid-column:3;justify-self:end}
+ .c-subject{grid-row:2;grid-column:1/-1}
+ .c-when{grid-row:3;grid-column:1/-1}
+ .c-sess{grid-row:1;grid-column:1/3;white-space:nowrap}
+ .c-proj{grid-row:1;grid-column:3;justify-self:end}
+ .c-sbranch{grid-row:2;grid-column:1/3}
+ .c-cwd{grid-row:2;grid-column:3;justify-self:end}
+ .c-run{grid-row:1;grid-column:1/3}
+ .c-rstate{grid-row:1;grid-column:3;justify-self:end}
+ .c-rnote{grid-row:2;grid-column:1/-1}
+ .c-evts{grid-row:1;grid-column:1}
+ .c-evtx{grid-row:1;grid-column:2/-1}
+ /* A three-line block tinted to 40% of its WIDTH reads as a column, not as
+    progress. Same number, drawn as a bar along the bottom edge instead. */
+ table.stack tr.prog{background:none;position:relative;padding-bottom:11px}
+ table.stack tr.prog::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;
+   background:linear-gradient(90deg,var(--accent) var(--pct),var(--line) var(--pct))}
+}
 @media (prefers-color-scheme:dark){
  :root{--bg:#0f1116;--card:#171a21;--ink:#e8eaf0;--muted:#8c93a6;--line:#252a35;--accent:#8f9ddb}
  .p-ok{background:#12301f;color:#5fce93}.p-bad{background:#3a1512;color:#f2938a}
@@ -792,6 +861,13 @@ def pill(text, kind):
     return f'<span class="pill p-{kind}">{html.escape(text)}</span>'
 
 
+def clip(text, lines=2):
+    """Long prose in a narrow cell: clamped, with the full text one hover or tap away."""
+    t = html.escape(text)
+    cls = "clip clip1" if lines == 1 else "clip"
+    return f'<span class="{cls}" tabindex="0" title="{t}">{t}</span>'
+
+
 def project_section(p, multi):
     s = []
     if multi:
@@ -801,7 +877,7 @@ def project_section(p, multi):
     # in flight first — it is the thing you are waiting on
     s.append('<h2>Í vinnslu núna</h2><div class="card">')
     if p["runs"]:
-        s.append("<table><tr><th>Staða</th><th>Verk</th><th>Hvað</th>"
+        s.append('<table class="stack"><tr class="hd"><th>Staða</th><th>Verk</th><th>Hvað</th>'
                  "<th>Tími</th><th>Áætlað eftir</th></tr>")
         # One self-hosted runner ⇒ one job at a time. A queued run is therefore
         # always waiting for THE RUNNER, and the thing holding it is whichever
@@ -821,22 +897,25 @@ def project_section(p, multi):
                 if eta:
                     pct = min(100, int(100 * r["mins"] / eta))
                     over = r["mins"] - eta
+                    # the percentage travels as a custom property, not a finished
+                    # gradient, so the phone can draw it as a bar instead (CSS)
                     if over <= 0:
                         left = f"~{eta - r['mins']}m eftir"
-                        row_style = (f' style="background:linear-gradient(90deg,'
-                                     f'rgba(55,71,143,.13) {pct}%,transparent {pct}%)"')
+                        row_style = f' class="prog" style="--pct:{pct}%"'
                     else:
                         left = f"+{over}m yfir áætlun"
-                        row_style = ' style="background:rgba(154,99,0,.12)"'
+                        row_style = ' class="over"'
                 else:
                     left = "keyrir"
             else:
                 left = (f'bíður eftir keyrara — {html.escape(holder["name"])} heldur honum'
                         if holder else "bíður eftir keyrara")
-            s.append(f'<tr{row_style}><td>{pill("keyrir" if busy else "bíður", "busy" if busy else "idle")}</td>'
-                     f'<td>{html.escape(r["name"])}</td>'
-                     f'<td class="muted">{html.escape(r["title"])}</td>'
-                     f'<td class="mono">{r["mins"]}m</td><td class="mono">{left}</td></tr>')
+            s.append(f'<tr{row_style}><td class="c-status">'
+                     f'{pill("keyrir" if busy else "bíður", "busy" if busy else "idle")}</td>'
+                     f'<td class="c-job">{clip(r["name"], 1)}</td>'
+                     f'<td class="c-what muted">{clip(r["title"])}</td>'
+                     f'<td class="c-time mono">{r["mins"]}m</td>'
+                     f'<td class="c-eta mono">{left}</td></tr>')
         s.append("</table>")
     else:
         s.append('<div class="empty">Ekkert í gangi.</div>')
@@ -845,8 +924,8 @@ def project_section(p, multi):
         s.append(f'<div class="hint">Miðgildi útgáfukeyrslu: {p["eta"]} mín.</div>')
 
     # releases — the join that catches a tag which never built
-    s.append('<h2>Útgáfur — merki → byggð?</h2><div class="card"><table>'
-             "<tr><th>Merki</th><th>Hvað</th><th>Staða</th><th></th></tr>")
+    s.append('<h2>Útgáfur — merki → byggð?</h2><div class="card"><table class="stack">'
+             '<tr class="hd"><th>Merki</th><th>Hvað</th><th>Staða</th><th></th></tr>')
     for r in p["releases"]:
         st = r["state"]
         kind, label, note = "idle", st, ""
@@ -865,10 +944,11 @@ def project_section(p, multi):
             kind, label = "busy", "byggist"
         elif st == "unknown":
             kind, label = "idle", "óþekkt"
-        s.append(f'<tr><td class="mono">{html.escape(r["tag"])}</td>'
-                 f'<td>{html.escape(r.get("title") or "")}</td>'
-                 f'<td>{pill(label, kind)}</td>'
-                 f'<td class="muted">{html.escape(note)}</td></tr>')
+        title = r.get("title") or ""
+        s.append(f'<tr><td class="c-tag mono">{html.escape(r["tag"])}</td>'
+                 f'<td class="c-rtitle">{clip(title) if title else ""}</td>'
+                 f'<td class="c-state">{pill(label, kind)}</td>'
+                 f'<td class="c-note muted">{clip(note) if note else ""}</td></tr>')
     s.append("</table></div>")
     if p["built_ok"] is False:
         s.append('<div class="hint">Náði ekki í byggingarstöðu — óþekkt.</div>')
@@ -880,12 +960,13 @@ def project_section(p, multi):
     # branches — what has NOT landed
     s.append('<h2>Greinar sem eru ekki komnar á main</h2><div class="card">')
     if p["branches"]:
-        s.append("<table><tr><th>Grein</th><th>Framar</th><th>Síðast</th><th>Efni</th></tr>")
+        s.append('<table class="stack"><tr class="hd"><th>Grein</th><th>Framar</th>'
+                 "<th>Síðast</th><th>Efni</th></tr>")
         for b in p["branches"]:
-            s.append(f'<tr><td class="mono">{html.escape(b["name"])}</td>'
-                     f'<td class="mono">+{b["ahead"]}</td>'
-                     f'<td class="muted">{html.escape(b["when"])}</td>'
-                     f'<td class="muted">{html.escape(b["subject"])}</td></tr>')
+            s.append(f'<tr><td class="c-branch mono">{clip(b["name"], 1)}</td>'
+                     f'<td class="c-ahead mono">+{b["ahead"]}</td>'
+                     f'<td class="c-when muted">{html.escape(b["when"])}</td>'
+                     f'<td class="c-subject muted">{clip(b["subject"])}</td></tr>')
         s.append("</table>")
     else:
         s.append('<div class="empty">Allt komið á main.</div>')
@@ -908,7 +989,8 @@ def page(d):
     # CI runners on THIS machine — watched and self-healed (see runner_watch_loop)
     rn = d.get("runners") or {}
     if rn.get("list"):
-        s.append('<div class="card"><table><tr><th>Keyrari</th><th>Staða</th><th></th></tr>')
+        s.append('<div class="card"><table class="stack"><tr class="hd">'
+                 "<th>Keyrari</th><th>Staða</th><th></th></tr>")
         for r in rn["list"]:
             if r["alive"]:
                 kind, label, note = "ok", "á lífi", ""
@@ -917,11 +999,13 @@ def page(d):
                 note = "endurræsing mistókst ítrekað — þarf handafl"
             else:
                 kind, label, note = "warn", "dauður", "reyni endurræsingu sjálfkrafa"
-            s.append(f'<tr><td class="mono">{html.escape(r["name"])}</td>'
-                     f'<td>{pill(label, kind)}</td><td class="muted">{html.escape(note)}</td></tr>')
+            s.append(f'<tr><td class="c-run mono">{clip(r["name"], 1)}</td>'
+                     f'<td class="c-rstate">{pill(label, kind)}</td>'
+                     f'<td class="c-rnote muted">{clip(note) if note else ""}</td></tr>')
         for e in rn.get("events", [])[:5]:
-            s.append(f'<tr><td class="mono muted">{e["ts"]}</td>'
-                     f'<td colspan=2 class="muted">{html.escape(e["runner"])}: {html.escape(e["action"])}</td></tr>')
+            s.append(f'<tr><td class="c-evts mono muted">{e["ts"]}</td>'
+                     f'<td colspan=2 class="c-evtx muted">{html.escape(e["runner"])}: '
+                     f'{html.escape(e["action"])}</td></tr>')
         s.append("</table></div>")
 
     multi = len(d["projects"]) > 1
@@ -931,12 +1015,14 @@ def page(d):
     # who is working — global, across every watched repo
     s.append('<h2>Lotur í gangi</h2><div class="card">')
     if d["sessions"]:
-        s.append("<table><tr><th>Lota</th><th>Verkefni</th><th>Grein</th><th>Mappa</th></tr>")
+        s.append('<table class="stack"><tr class="hd"><th>Lota</th><th>Verkefni</th>'
+                 "<th>Grein</th><th>Mappa</th></tr>")
         for x in d["sessions"]:
-            s.append(f'<tr><td><span class="dot"></span>{html.escape(x["name"])}</td>'
-                     f'<td class="muted">{html.escape(x["repo"])}</td>'
-                     f'<td class="mono">{html.escape(x["branch"])}</td>'
-                     f'<td class="muted">{html.escape(x["cwd"])}</td></tr>')
+            s.append(f'<tr><td class="c-sess"><span class="dot"></span>'
+                     f'{html.escape(x["name"])}</td>'
+                     f'<td class="c-proj muted">{clip(x["repo"], 1)}</td>'
+                     f'<td class="c-sbranch mono">{clip(x["branch"], 1)}</td>'
+                     f'<td class="c-cwd muted">{clip(x["cwd"], 1)}</td></tr>')
         s.append("</table>")
     else:
         s.append('<div class="empty">Engin lota keyrir.</div>')
@@ -953,7 +1039,11 @@ class Handler(BaseHTTPRequestHandler):
             # Swap the content in place instead of <meta refresh>: a full reload
             # throws you back to the top every 20 s, which makes everything below
             # the fold unreadable — the sections you scrolled down to see.
-            js = ("<script>setInterval(async()=>{"
+            # Delegated, so it survives the content swap below replacing every row.
+            # A tap on a clamped subject shows all of it; a second tap folds it.
+            js = ("<script>document.addEventListener('click',e=>{"
+                  "const c=e.target.closest('.clip');if(c)c.classList.toggle('open');});"
+                  "setInterval(async()=>{"
                   "try{const r=await fetch('/',{cache:'no-store'});"
                   "const d=new DOMParser().parseFromString(await r.text(),'text/html');"
                   "const n=d.querySelector('.wrap'),o=document.querySelector('.wrap');"
