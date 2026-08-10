@@ -216,10 +216,22 @@ def _built_balena(cfg):
     built = {}
     try:
         for r in json.loads(raw):
-            if r.get("semver"):
-                # is_final matters as much as status: a DRAFT built fine but no
-                # device will ever take it, so calling it "shipped" is a lie.
-                built[r["semver"]] = (r.get("status", "?"), bool(r.get("is_final")))
+            sem = r.get("semver")
+            if not sem:
+                continue
+            # is_final matters as much as status: a DRAFT built fine but no
+            # device will ever take it, so calling it "shipped" is a lie.
+            entry = (r.get("status", "?"), bool(r.get("is_final")))
+            prev = built.get(sem)
+            # A semver can have SEVERAL releases — a failed build plus a re-run
+            # that succeeded (or a local push that errored + a CI push that
+            # built). "Built" means ANY of them succeeded, so a success must
+            # never be clobbered by a failed sibling. The list is newest-first,
+            # so an older errored row arrives LAST and used to overwrite the good
+            # one — reporting a shipped version as ALDREI BYGGÐ (v5.9.23,
+            # 2026-08-10). Keep the first success we see; only upgrade toward it.
+            if prev is None or (prev[0] != "success" and entry[0] == "success"):
+                built[sem] = entry
     except Exception:
         return {}, False
     return built, True
