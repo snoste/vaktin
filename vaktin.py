@@ -61,6 +61,10 @@ PORT = int(os.environ.get("PORT", "8787"))
 CACHE_SECONDS = int(os.environ.get("VAKTIN_CACHE_SECONDS", "15"))
 SESSION_DIR = os.path.expanduser(
     os.environ.get("VAKTIN_SESSION_DIR", "~/.claude/sessions"))
+# Where a session's transcript lives; {id} is its session id. Its mtime is the
+# only available answer to "is this session still doing anything?".
+TRANSCRIPT_GLOB = os.path.expanduser(
+    os.environ.get("VAKTIN_TRANSCRIPT_GLOB", "~/.claude/projects/*/{id}.jsonl"))
 CONFIG_HOME = os.path.expanduser("~/.config/vaktin")
 
 
@@ -154,13 +158,42 @@ def sessions(roots):
                 if nm and nm in cwd:
                     repo = nm
                     break
+        started = 0
+        try:
+            started = int(s.get("startedAt") or 0) / 1000
+        except Exception:
+            pass
+        last = _last_activity(s.get("sessionId") or "") or started
         out.append({
             "name": s.get("name") or "?",
             "cwd": os.path.basename(cwd) or cwd,
             "branch": run(["git", "rev-parse", "--abbrev-ref", "HEAD"], 5, cwd) or "—",
             "repo": repo,
+            "started": started,
+            "last": last,
+            "idle": max(0, time.time() - last) if last else 0,
         })
-    return sorted(out, key=lambda x: (x["repo"], x["name"]))
+    # Most recently active first: a list sorted by name buries the session that
+    # is actually doing something under a dozen that have sat idle for a day.
+    return sorted(out, key=lambda x: -x["last"])
+
+
+def _last_activity(sid):
+    """When the session last WROTE anything.
+
+    A live pid is not a working session — one can sit at a prompt for a day and
+    still pass the kill(0) check, which made every session look equally busy.
+    The transcript's mtime is the honest signal, so an absent transcript reports
+    nothing (0) rather than pretending the start time was activity."""
+    if not sid:
+        return 0
+    times = []
+    for f in glob.glob(TRANSCRIPT_GLOB.replace("{id}", sid)):
+        try:
+            times.append(os.path.getmtime(f))
+        except OSError:
+            pass
+    return max(times) if times else 0
 
 
 def branches(root, cfg):
@@ -819,6 +852,7 @@ tr:last-child td{border-bottom:none}
 .p-busy{background:#e8ebf7;color:var(--busy)}
 .p-idle{background:#eef0f5;color:var(--muted)}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;background:var(--busy)}
+.dot.off{background:var(--muted);opacity:.45}
 .ref-tag{color:var(--accent);font-weight:600}
 /* The row IS the progress bar: the fill sweeps left to right as elapsed/ETA grows. */
 tr.prog{background:linear-gradient(90deg,rgba(55,71,143,.13) var(--pct),transparent var(--pct))}
@@ -888,6 +922,11 @@ code{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;
  .c-proj{grid-row:1;grid-column:3;justify-self:end}
  .c-sbranch{grid-row:2;grid-column:1/3}
  .c-cwd{grid-row:2;grid-column:3;justify-self:end}
+ /* the header row is gone here, so the two times have to name themselves */
+ .c-start{grid-row:3;grid-column:1/3}
+ .c-start::before{content:"frá "}
+ .c-last{grid-row:3;grid-column:3;justify-self:end}
+ .c-last::before{content:"virk "}
  .c-run{grid-row:1;grid-column:1/3}
  .c-rstate{grid-row:1;grid-column:3;justify-self:end}
  .c-rnote{grid-row:2;grid-column:1/-1}
@@ -910,6 +949,26 @@ code{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;
 
 def pill(text, kind):
     return f'<span class="pill p-{kind}">{html.escape(text)}</span>'
+
+
+def clock(ts):
+    """Wall-clock time, dated only when it is not today — a bare 13:43 on a
+    session that started yesterday is a lie you read twice."""
+    if not ts:
+        return "—"
+    t = time.localtime(ts)
+    return time.strftime("%H:%M" if t[:3] == time.localtime()[:3] else "%d.%m. %H:%M", t)
+
+
+def ago(sec):
+    if sec < 90:
+        return "núna"
+    m = int(sec // 60)
+    if m < 60:
+        return f"fyrir {m} mín"
+    if m < 60 * 24:
+        return f"fyrir {m // 60} klst"
+    return f"fyrir {m // 1440} d"
 
 
 def clip(text, lines=2):
@@ -1094,13 +1153,20 @@ def page(d):
     s.append('<h2>Lotur í gangi</h2><div class="card">')
     if d["sessions"]:
         s.append('<table class="stack"><tr class="hd"><th>Lota</th><th>Verkefni</th>'
-                 "<th>Grein</th><th>Mappa</th></tr>")
+                 "<th>Grein</th><th>Mappa</th><th>Byrjaði</th><th>Síðast virk</th></tr>")
         for x in d["sessions"]:
-            s.append(f'<tr><td class="c-sess"><span class="dot"></span>'
-                     f'{html.escape(x["name"])}</td>'
+            # A live pid says the window is open, not that anyone is working in
+            # it: the dot follows the transcript, so idle sessions go grey.
+            idle = x.get("idle") or 0
+            live = bool(x.get("last")) and idle < 600
+            s.append(f'<tr><td class="c-sess"><span class="dot{"" if live else " off"}">'
+                     f'</span>{html.escape(x["name"])}</td>'
                      f'<td class="c-proj muted">{clip(x["repo"], 1)}</td>'
                      f'<td class="c-sbranch mono">{clip(x["branch"], 1)}</td>'
-                     f'<td class="c-cwd muted">{clip(x["cwd"], 1)}</td></tr>')
+                     f'<td class="c-cwd muted">{clip(x["cwd"], 1)}</td>'
+                     f'<td class="c-start mono muted">{clock(x.get("started"))}</td>'
+                     f'<td class="c-last mono{"" if live else " muted"}">'
+                     f'{ago(idle) if x.get("last") else "—"}</td></tr>')
         s.append("</table>")
     else:
         s.append('<div class="empty">Engin lota keyrir.</div>')
