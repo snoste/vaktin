@@ -410,6 +410,49 @@ def job_minutes(root, run_id):
     return best
 
 
+# A job that GitHub refused to start still reports conclusion "failure", the same
+# word a broken test gets — but it has run no steps and it died in seconds. That
+# ceiling separates the two: real work, even work that fails instantly, records at
+# least one step. Generous on purpose; the discriminator is `steps == []`.
+NEVER_STARTED_MAX_S = 20
+
+
+def never_started_jobs(root, run_id):
+    """How many of this run's jobs GitHub never actually started.
+
+    The third member of the family classify_miss exists for: a cause with its own
+    remedy wearing a generic surface. When hosted minutes run out — a failed
+    payment, a spending limit, a suspended org — every hosted job in the run comes
+    back conclusion "failure" having executed NOTHING: `steps: []`, a span of a few
+    seconds, and an annotation that says so. Read as a plain failure it sends you
+    reading test logs that do not exist, for a fix that lives in the billing page.
+
+    Measured on the project this was written for (2026-08-13): shards 2-6 of the
+    release gate failed in 2-9s with no steps while shard 1, the only one on a
+    self-hosted runner, passed — the tell that it was the RUNNERS, not the suite.
+    """
+    raw = run(["gh", "run", "view", str(run_id), "--json", "jobs"], 25, root)
+    blocked = total = 0
+    try:
+        for j in (json.loads(raw or "{}").get("jobs") or []):
+            total += 1
+            if j.get("conclusion") != "failure" or (j.get("steps") or []):
+                continue
+            a, b = j.get("startedAt"), j.get("completedAt")
+            if not (a and b):
+                continue
+            try:
+                ta = time.mktime(time.strptime(a, "%Y-%m-%dT%H:%M:%SZ"))
+                tb = time.mktime(time.strptime(b, "%Y-%m-%dT%H:%M:%SZ"))
+            except Exception:
+                continue
+            if (tb - ta) <= NEVER_STARTED_MAX_S:
+                blocked += 1
+    except Exception:
+        return {"blocked": 0, "total": 0}
+    return {"blocked": blocked, "total": total}
+
+
 def classify_miss(tag, runs, cfg):
     """Why this tag has no build, and what to actually DO about it.
 
@@ -435,6 +478,22 @@ def classify_miss(tag, runs, cfg):
         return "", "engin keyrsla fannst fyrir þetta merki"
     if r["status"] in ("in_progress", "queued", "pending", "waiting"):
         return "", "byggist núna"
+    # A run whose jobs GitHub never STARTED. Reported as a plain "failure", so it
+    # used to fall through to "skoðaðu keyrsluna" and send you hunting through
+    # test logs that were never written. Same trap as the cancelled pair below,
+    # different surface — and here the remedy is not in the repo at all.
+    if r["conclusion"] == "failure":
+        b = r.get("blocked") or {}
+        if b.get("blocked"):
+            n, tot = b["blocked"], b.get("total") or b["blocked"]
+            rest = tot - n
+            tail = (f"{rest} af {tot} {'komst' if rest == 1 else 'komust'} af stað "
+                    "— þau keyra á eigin vélum" if rest else "ekkert komst af stað")
+            return ("failure",
+                    f"GitHub RÆSTI ALDREI {n} af {tot} verkefnum (0 skref, dóu á "
+                    f"sekúndum); {tail}. Þetta er greiðslu-/kvótastopp hjá GitHub, "
+                    "ekki bilað próf: rerun gerir ekkert fyrr en það er leyst. "
+                    "Athugaðu Billing & plans, eða beindu verkefnunum á eigin vélar")
     if r["conclusion"] != "cancelled":
         return r["conclusion"], "skoðaðu keyrsluna"
 
@@ -530,6 +589,10 @@ def releases(root, cfg):
             r = runs.get(t)
             if r and r.get("conclusion") == "cancelled" and "job_mins" not in r:
                 r["job_mins"] = job_minutes(root, r["id"])
+            # Same one-extra-call-per-missing-tag budget as job_mins above: only a
+            # tag already known to have no build is worth asking GitHub about.
+            if r and r.get("conclusion") == "failure" and "blocked" not in r:
+                r["blocked"] = never_started_jobs(root, r["id"])
         spans = [runs[t]["job_mins"] for t in misses
                  if runs.get(t) and runs[t].get("job_mins")]
         for t in misses:
