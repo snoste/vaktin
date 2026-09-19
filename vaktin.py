@@ -57,6 +57,11 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# gcloud writes a log file for every command and keeps 30 days of them. Polling Cloud Run every
+# couple of minutes made ~2,000 files a day, 4.4 GB on the Mac mini (2026-09-14). The answers
+# come back on stdout, so the files are never read.
+os.environ.setdefault("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "true")
+
 PORT = int(os.environ.get("PORT", "8787"))
 CACHE_SECONDS = int(os.environ.get("VAKTIN_CACHE_SECONDS", "15"))
 SESSION_DIR = os.path.expanduser(
@@ -108,21 +113,25 @@ def repo_config(root):
     someone changed it upstream.
     """
     cfg = {}
+    # origin/main's blob FIRST: the watched clone is a mirror whose working
+    # tree is frozen at clone time (branches() fetches refs, nothing checks
+    # out), so the on-disk file kept a config from months back and quietly
+    # ignored every key added since (the openbalena block, 2026-09-19). The
+    # working-tree file is the fallback for a repo with no remote.
+    for ref in ("origin/main", "origin/master"):
+        raw = run(["git", "show", f"{ref}:.vaktin.json"], 10, root)
+        if raw:
+            try:
+                cfg = json.loads(raw) or {}
+                break
+            except Exception:
+                pass
     f = os.path.join(root, ".vaktin.json")
-    if os.path.isfile(f):
+    if not cfg and os.path.isfile(f):
         try:
             cfg = json.load(open(f)) or {}
         except Exception:
             cfg = {}
-    if not cfg:
-        for ref in ("origin/main", "origin/master", "HEAD"):
-            raw = run(["git", "show", f"{ref}:.vaktin.json"], 10, root)
-            if raw:
-                try:
-                    cfg = json.loads(raw) or {}
-                    break
-                except Exception:
-                    pass
     cfg.setdefault("name", os.path.basename(root.rstrip("/")))
     cfg.setdefault("tag_glob", "v*")
     cfg.setdefault("trunk", "main")
@@ -240,6 +249,40 @@ def built_map(root, cfg):
     if cfg.get("cloud_run"):
         return _built_cloud_run(root, cfg)
     return {}, None                           # not configured → not an error
+
+
+def _built_openbalena(cfg):
+    """Same join against a self-hosted openBalena instance. The CLI that can
+    talk to it lives on the builder box (the same one release.sh deploys
+    through), so the question goes over ssh, BatchMode, and answers the
+    text table `balena release list` prints there: ID COMMIT CREATED STATUS
+    SEMVER IS_FINAL... Config block in .vaktin.json:
+      "openbalena": {"builder": "user@host", "key": "~/.ssh/id", "cli": "~/balena/bin/balena",
+                     "url": "balena.example.is", "fleet": "admin/my-fleet"}"""
+    ob = cfg.get("openbalena") or {}
+    if not ob.get("builder") or not ob.get("fleet"):
+        return {}, None
+    key = os.path.expanduser(ob.get("key", ""))
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if key:
+        cmd += ["-i", key]
+    remote = (f"env BALENARC_BALENA_URL={ob.get('url', '')} {ob.get('cli', 'balena')} "
+              f"release list {ob['fleet']} 2>/dev/null")
+    raw = run(cmd + [ob["builder"], remote], 40)
+    if not raw:
+        return {}, False
+    built = {}
+    for line in raw.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 5:
+            continue
+        status, sem = cols[3], cols[4]
+        final = (cols[5].lower() == "true") if len(cols) > 5 else True
+        entry = (status, final)
+        prev = built.get(sem)
+        if prev is None or (prev[0] != "success" and entry[0] == "success"):
+            built[sem] = entry
+    return built, True
 
 
 def _built_balena(cfg):
@@ -543,6 +586,11 @@ def release_titles(root):
     number is not an answer. The titles already exist as the release-notes
     headings (`# <Product> vX.Y.Z — Title`), so read them instead of inventing
     a second naming scheme. Fallback per tag: the annotated tag's own subject.
+
+    The heading's separator is whatever the house style is that year: an em
+    dash until 2026-08-26, a colon since ("Engin löng bandstrik"), and a plain
+    hyphen is accepted too. A regex pinned to one of them silently blanked
+    the whole column for a month (found 2026-09-19).
     """
     titles = {}
     # From origin/main's blob, not the mirror's working tree: branches() fetches
@@ -550,7 +598,7 @@ def release_titles(root):
     # RELEASE.md is frozen at clone time and silently loses every new title.
     text = run(["git", "show", "origin/main:RELEASE.md"], cwd=root)
     for line in text.splitlines():
-        m = re.match(r"#\s+.*?\bv?(\d+\.\d+\.\d+[\w.-]*)\s+—\s+(.+)", line)
+        m = re.match(r"#\s+.*?\bv?(\d+\.\d+\.\d+[\w.-]*)\s*(?:—|–|:|-)\s+(.+)", line)
         if m and m.group(1) not in titles:
             titles[m.group(1)] = m.group(2).strip()
     return titles
@@ -560,12 +608,32 @@ def tag_subject(root, tag):
     """The annotated tag's message subject — fallback when RELEASE.md has no
     heading for this version (e.g. a tag cut without notes)."""
     s = run(["git", "tag", "-l", "--format=%(contents:subject)", tag], cwd=root)
-    return "" if s.startswith("Release v") else s   # the script's boilerplate says nothing
+    # the release script's boilerplate ("Release vX" / "release: bump to vX") says nothing
+    return "" if re.match(r"(?i)release(: bump to)? v", s) else s
+
+
+def _state_of(sem, built, ok):
+    """One target's verdict for a version, without the run diagnosis."""
+    if ok is None:
+        return "unconfigured"
+    if sem in built:
+        status, final = built[sem][0], built[sem][1]
+        if status == "success":
+            return "shipped" if final else "draft"
+        if status in ("running", "pending"):
+            return "running"
+        return "not-built"
+    return "not-built" if ok else "unknown"
 
 
 def releases(root, cfg):
-    """Tags joined to what was actually built — the join nothing else does."""
+    """Tags joined to what was actually built — the join nothing else does.
+    Two targets when both are configured: balenaCloud (`fleet`) is the one the
+    run diagnosis speaks for; openBalena (`openbalena`) is a second column, so
+    a tag that reached the canary fleet but never built on balenaCloud (or the
+    reverse) reads as exactly that."""
     built, ok = built_map(root, cfg)
+    ob_built, ob_ok = _built_openbalena(cfg)
     titles = release_titles(root)
     runs = deploy_runs(root, cfg) if ok is not None else {}
     tags = run(["git", "tag", "-l", cfg["tag_glob"], "--sort=-v:refname"],
@@ -625,6 +693,7 @@ def releases(root, cfg):
         else:
             state = "unknown"
         out.append({"tag": t, "state": state, "note": note,
+                    "ob_state": _state_of(sem, ob_built, ob_ok),
                     "title": titles.get(sem) or tag_subject(root, t)})
     return out, ok
 
@@ -1155,8 +1224,13 @@ def project_section(p, multi):
         s.append(f'<div class="hint">Miðgildi útgáfukeyrslu: {p["eta"]} mín.</div>')
 
     # releases — the join that catches a tag which never built
+    two = any(r.get("ob_state") not in (None, "unconfigured") for r in p["releases"])
     s.append('<h2>Útgáfur — merki → byggð?</h2><div class="card"><table class="stack">'
-             '<tr class="hd"><th>Merki</th><th>Hvað</th><th>Staða</th><th></th></tr>')
+             '<tr class="hd"><th>Merki</th><th>Hvað</th>'
+             + ('<th>balenaCloud</th><th>openBalena</th>' if two else '<th>Staða</th>')
+             + '<th></th></tr>')
+    OB = {"shipped": ("ok", "komin út"), "draft": ("warn", "drög"), "not-built": ("bad", "ALDREI BYGGÐ"),
+          "running": ("busy", "byggist"), "unknown": ("idle", "óþekkt")}
     for r in p["releases"]:
         st = r["state"]
         kind, label, note = "idle", st, ""
@@ -1176,9 +1250,13 @@ def project_section(p, multi):
         elif st == "unknown":
             kind, label = "idle", "óþekkt"
         title = r.get("title") or ""
+        ob_cell = ""
+        if two:
+            ok_kind, ok_label = OB.get(r.get("ob_state"), ("idle", "óþekkt"))
+            ob_cell = f'<td class="c-state">{pill(ok_label, ok_kind)}</td>'
         s.append(f'<tr><td class="c-tag mono">{html.escape(r["tag"])}</td>'
                  f'<td class="c-rtitle">{clip(title) if title else ""}</td>'
-                 f'<td class="c-state">{pill(label, kind)}</td>'
+                 f'<td class="c-state">{pill(label, kind)}</td>{ob_cell}'
                  f'<td class="c-note muted">{clip(note) if note else ""}</td></tr>')
     s.append("</table></div>")
     if p["built_ok"] is False:
