@@ -75,12 +75,21 @@ CONFIG_HOME = os.path.expanduser("~/.config/vaktin")
 
 def run(cmd, timeout=25, cwd=None):
     """Never raise, never hang: a dead CLI must not take the page with it."""
+    return run_err(cmd, timeout, cwd)[0]
+
+
+def run_err(cmd, timeout=25, cwd=None):
+    """(stdout, stderr) — for the few callers that must say WHY a CLI refused.
+    "Unknown" with no reason is the answer that sends you reading logs; a
+    target that is merely logged out should say so on the page."""
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                            timeout=timeout)
-        return p.stdout.strip() if p.returncode == 0 else ""
-    except Exception:
-        return ""
+        if p.returncode == 0:
+            return p.stdout.strip(), ""
+        return "", (p.stderr or "").strip()
+    except Exception as e:
+        return "", str(e)
 
 
 # ── which repositories to watch ──────────────────────────────────────────────
@@ -244,6 +253,8 @@ def built_map(root, cfg):
     (None → skip the join, still list tags), configured but unreachable
     (False → say "unknown", never "never built"), and configured and answered.
     """
+    global _cloud_run_why
+    _cloud_run_why = ""                       # per repo: one panel's reason is not another's
     if cfg.get("fleet"):
         return _built_balena(cfg)
     if cfg.get("cloud_run"):
@@ -313,6 +324,9 @@ def _built_balena(cfg):
     return built, True
 
 
+_cloud_run_why = ""       # set by _built_cloud_run when the CLI refuses, shown on the page
+
+
 def _built_cloud_run(root, cfg):
     """Cloud Run's answer to "was this tag actually built?".
 
@@ -336,14 +350,26 @@ def _built_cloud_run(root, cfg):
     if not (service and region and project and image):
         return {}, None                       # half-configured → same as absent
 
-    revs = run(["gcloud", "run", "revisions", "list", "--service", service,
-                "--region", region, "--project", project,
-                "--format=json", "--limit", "100"], 45)
+    revs, err = run_err(["gcloud", "run", "revisions", "list", "--service", service,
+                         "--region", region, "--project", project,
+                         "--format=json", "--limit", "100"], 45)
     svc = run(["gcloud", "run", "services", "describe", service, "--region", region,
                "--project", project, "--format=json"], 45)
     imgs = run(["gcloud", "container", "images", "list-tags", image,
                 "--format=json", "--limit", "200"], 45)
     if not (revs and svc and imgs):
+        # One reason is worth naming because it is invisible and self-inflicted:
+        # a keyless (WIF) deploy leaves its external-account credential as
+        # gcloud's ACTIVE account on the runner host, and its OIDC token expires
+        # minutes later. Every later gcloud call by that user then fails, this
+        # panel greys out, and nothing says why (blabot, 2026-09-20).
+        global _cloud_run_why
+        if "auth" in err.lower() or "credential" in err.lower() or "token" in err.lower():
+            _cloud_run_why = ("gcloud er ekki innskráð á þessari vél — "
+                              "keyless (WIF) útgáfa skildi eftir útrunnið token. "
+                              "Keyrðu `gcloud auth login` (eða virkjaðu þjónustureikning).")
+        elif err:
+            _cloud_run_why = err.splitlines()[0][:160]
         return {}, False                      # unreachable → "unknown", not "never built"
 
     try:
@@ -606,10 +632,19 @@ def release_titles(root):
 
 def tag_subject(root, tag):
     """The annotated tag's message subject — fallback when RELEASE.md has no
-    heading for this version (e.g. a tag cut without notes)."""
+    heading for this version (a repo that keeps its notes elsewhere, or a tag
+    cut without notes).
+
+    The prefix a release script writes ("Release v5.20.2:", "release: bump to
+    v5.20.2") says nothing on a row that already shows the version — but what
+    FOLLOWS it usually says everything, and blanking the whole line threw that
+    away. blabot's every title was empty for exactly this reason (2026-09-20):
+    its tags read "Release v5.20.2: version chip and notes for the v5.20.1
+    build". Strip the prefix, keep the rest, blank only when nothing remains.
+    """
     s = run(["git", "tag", "-l", "--format=%(contents:subject)", tag], cwd=root)
-    # the release script's boilerplate ("Release vX" / "release: bump to vX") says nothing
-    return "" if re.match(r"(?i)release(: bump to)? v", s) else s
+    rest = re.sub(r"(?i)^\s*release(:\s*bump\s*to)?\s+v?\d[\w.-]*\s*[:—–-]?\s*", "", s)
+    return rest.strip()
 
 
 def _state_of(sem, built, ok):
@@ -945,7 +980,7 @@ def gather():
         projects.append({
             "name": cfg["name"], "root": root,
             "branches": branches(root, cfg), "releases": rel,
-            "built_ok": ok, "runs": runs, "eta": eta,
+            "built_ok": ok, "built_why": _cloud_run_why, "runs": runs, "eta": eta,
             "note": cfg.get("note", ""),
         })
     data = {"projects": projects, "sessions": sessions(roots),
@@ -1260,7 +1295,9 @@ def project_section(p, multi):
                  f'<td class="c-note muted">{clip(note) if note else ""}</td></tr>')
     s.append("</table></div>")
     if p["built_ok"] is False:
-        s.append('<div class="hint">Náði ekki í byggingarstöðu — óþekkt.</div>')
+        why = p.get("built_why") or ""
+        s.append('<div class="hint">Náði ekki í byggingarstöðu — óþekkt.'
+                 + (f' {html.escape(why)}' if why else "") + '</div>')
     elif p["built_ok"] is None:
         s.append('<div class="hint">Ekkert <code>fleet</code> eða '
                  '<code>cloud_run</code> í <code>.vaktin.json</code> — merki eru '
