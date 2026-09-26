@@ -819,7 +819,12 @@ def _workflow_eta(root, workflow):
 OFFICE_DIR = os.path.expanduser(os.environ.get("VAKTIN_OFFICE_DIR", "~/.config/agents-office"))
 # The desk that answers the roles (a separate page): linked from the panel's heading so
 # the phone finds it from here. Empty = no link. A port means "this host, that port".
-OFFICE_DESK = os.environ.get("VAKTIN_OFFICE_DESK", "8788").strip()
+OFFICE_DESK = os.environ.get("VAKTIN_OFFICE_DESK", "").strip()
+if not OFFICE_DESK:
+    try:                                     # a full URL (the desk may be https on another name)
+        OFFICE_DESK = open(os.path.join(CONFIG_HOME, "desk-url")).read().strip()
+    except OSError:
+        OFFICE_DESK = "8788"
 
 
 def _office_week_key(now=None):
