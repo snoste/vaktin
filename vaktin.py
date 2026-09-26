@@ -811,6 +811,242 @@ def _workflow_eta(root, workflow):
 # shows red — a runner that dies instantly every time needs a human, and a
 # kickstart loop would just hide that.
 
+# ── failures: why a run failed, kept past GitHub's log retention ─────────────
+# A failed gate tells you WHICH tests failed for as long as GitHub keeps the log
+# (90 days), and then only if you open the run. Nothing joins them: the same
+# test failing every second week on a different commit looks like a new problem
+# each time. So every failed run is read once, its failing tests and first error
+# lines are written to a small JSON file per project, and the page lists them
+# with the commit that later turned the run green on the same branch. Read-only
+# against GitHub, append-only on disk, never pruned: a season of failures is a
+# few hundred kilobytes.
+FAIL_DIR = os.path.join(CONFIG_HOME, "failures")
+FAIL_POLL_SECONDS = int(os.environ.get("VAKTIN_FAIL_POLL_SECONDS", "300"))
+FAIL_RUNS = 60                       # how far back one poll looks
+FAIL_LOGS_PER_POLL = 3               # job logs are large; spread the reading out
+FAIL_LOG_TIMEOUT = 60
+FAIL_BAD = ("failure", "cancelled", "timed_out", "startup_failure")
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_TS = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z\s?")
+_PW = re.compile(r"✘\s+\d+\s+\[([^\]]+)\]\s+›\s+(.+)$")
+_PW_TAIL = re.compile(r"\s*(?:\(retry #\d+\)\s*)?(?:\([\d.]+m?s\))?\s*$")
+_PY = re.compile(r"^(?:FAILED|ERROR)\s+(\S+::\S+)")
+_NODE = re.compile(r"^(?:FAIL|not ok)\s+(?:\d+\s+-\s+)?(.+?)\s*$")
+# "Error: …" as Playwright prints it, "E   AssertionError: …" as pytest does.
+_ERR = re.compile(r"^(?:E\s+)?(?:Error|\w+Error|\w+Exception):\s*(.+)$")
+
+
+def parse_failure_log(text):
+    """{"tests": [{"id", "projects": [..], "times": n}], "errors": [..]} from a job log.
+
+    Playwright's ✘ lines (one per project and retry: the id drops both, so a
+    test that failed on four projects twice is ONE entry with times 8), pytest's
+    FAILED/ERROR lines, node's `not ok` / `FAIL`, and the first distinct error
+    lines for the why. Timestamps and colour codes are stripped first."""
+    tests, order, errors = {}, [], []
+    for raw in (text or "").splitlines():
+        line = _TS.sub("", _ANSI.sub("", raw)).strip()
+        if not line:
+            continue
+        m = _PW.search(line)
+        if m:
+            proj, rest = m.group(1), _PW_TAIL.sub("", m.group(2))
+            key = rest.replace(" › ", " › ")
+            t = tests.get(key)
+            if not t:
+                t = tests[key] = {"id": key, "projects": [], "times": 0}
+                order.append(key)
+            t["times"] += 1
+            if proj not in t["projects"]:
+                t["projects"].append(proj)
+            continue
+        m = _PY.match(line)
+        if m:
+            key = m.group(1)
+            t = tests.get(key)
+            if not t:
+                t = tests[key] = {"id": key, "projects": [], "times": 0}
+                order.append(key)
+            t["times"] += 1
+            continue
+        m = _NODE.match(line)
+        if m and len(m.group(1)) < 200:
+            key = m.group(1)
+            if key not in tests:
+                tests[key] = {"id": key, "projects": [], "times": 1}
+                order.append(key)
+            continue
+        m = _ERR.match(line)
+        if m and len(errors) < 8:
+            e = m.group(1)[:220]
+            if e not in errors:
+                errors.append(e)
+    return {"tests": [tests[k] for k in order], "errors": errors}
+
+
+def _fail_store_path(cfg):
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", cfg.get("name") or "project")
+    return os.path.join(FAIL_DIR, f"{safe}.json")
+
+
+def load_failures(cfg):
+    try:
+        with open(_fail_store_path(cfg)) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and isinstance(d.get("runs"), dict) else {"runs": {}}
+    except Exception:
+        return {"runs": {}}
+
+
+def _save_failures(cfg, store):
+    try:
+        os.makedirs(FAIL_DIR, exist_ok=True)
+        tmp = _fail_store_path(cfg) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(store, f, ensure_ascii=False)
+        os.replace(tmp, _fail_store_path(cfg))
+    except OSError:
+        pass
+
+
+def _epoch(s):
+    try:
+        return int(time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone)
+    except Exception:
+        return 0
+
+
+def collect_failures(root, cfg):
+    """One poll: record every newly failed run, read its logs, and mark older
+    failures fixed by the first green run that followed on the same branch."""
+    store = load_failures(cfg)
+    runs = store["runs"]
+    fields = "databaseId,name,conclusion,status,headBranch,headSha,displayTitle,createdAt,updatedAt"
+    raw = run(["gh", "run", "list", "--limit", str(FAIL_RUNS), "--json", fields], 30, root)
+    try:
+        listed = json.loads(raw or "[]")
+    except Exception:
+        return store
+    nwo = None
+    read = 0
+    changed = False
+    for r in listed:
+        rid = str(r.get("databaseId") or "")
+        if not rid or r.get("status") != "completed" or r.get("conclusion") not in FAIL_BAD:
+            continue
+        if rid in runs:
+            continue
+        # A run cancelled within minutes on a branch is a newer push evicting it
+        # (cancel-in-progress), not a failure worth a row. A cancelled RELEASE
+        # run, or one that ran long enough to have hit a ceiling, is.
+        mins = max(0, (_epoch(r.get("updatedAt") or "") - _epoch(r.get("createdAt") or "")) // 60)
+        ref = r.get("headBranch") or ""
+        if r.get("conclusion") == "cancelled" and mins < 20 and not re.match(r"^v?\d+\.\d+", ref):
+            continue
+        if read >= FAIL_LOGS_PER_POLL:
+            break                          # the rest next poll; the list is newest first
+        read += 1
+        rec = {"id": rid, "workflow": r.get("name") or "", "conclusion": r.get("conclusion") or "",
+               "branch": r.get("headBranch") or "", "sha": (r.get("headSha") or "")[:7],
+               "title": r.get("displayTitle") or "", "created": _epoch(r.get("createdAt") or ""),
+               "mins": mins,
+               "jobs": [], "blocked": 0, "tests": [], "errors": [], "fixed": None}
+        jraw = run(["gh", "run", "view", rid, "--json", "jobs"], 25, root)
+        try:
+            jobs = json.loads(jraw or "{}").get("jobs") or []
+        except Exception:
+            jobs = []
+        for j in jobs:
+            if j.get("conclusion") not in ("failure", "cancelled", "timed_out"):
+                continue
+            steps = j.get("steps") or []
+            span = _epoch(j.get("completedAt") or "") - _epoch(j.get("startedAt") or "")
+            rec["jobs"].append({"name": j.get("name") or "", "conclusion": j.get("conclusion") or "",
+                                "mins": max(0, span // 60)})
+            if j.get("conclusion") == "failure" and not steps and 0 <= span <= NEVER_STARTED_MAX_S:
+                rec["blocked"] += 1
+                continue
+            if j.get("conclusion") != "failure" or not j.get("databaseId"):
+                continue
+            if nwo is None:
+                nwo = run(["gh", "repo", "view", "--json", "nameWithOwner",
+                           "-q", ".nameWithOwner"], cwd=root) or ""
+            if not nwo:
+                continue
+            log = run(["gh", "api", f"repos/{nwo}/actions/jobs/{j['databaseId']}/logs"],
+                      FAIL_LOG_TIMEOUT, root)
+            parsed = parse_failure_log(log)
+            have = {t["id"]: t for t in rec["tests"]}
+            for t in parsed["tests"]:
+                h = have.get(t["id"])
+                if h:
+                    h["times"] += t["times"]
+                    for pr in t["projects"]:
+                        if pr not in h["projects"]:
+                            h["projects"].append(pr)
+                else:
+                    rec["tests"].append(t)
+                    have[t["id"]] = t
+            for e in parsed["errors"]:
+                if e not in rec["errors"] and len(rec["errors"]) < 8:
+                    rec["errors"].append(e)
+        runs[rid] = rec
+        changed = True
+    # The fix: the first green run of the same workflow on the same branch after
+    # the failure. Read from the same listing, so it costs nothing extra.
+    greens = [r for r in listed if r.get("conclusion") == "success"]
+    for rec in runs.values():
+        if rec.get("fixed"):
+            continue
+        after = [g for g in greens if g.get("name") == rec["workflow"]
+                 and (g.get("headBranch") or "") == rec["branch"]
+                 and _epoch(g.get("createdAt") or "") > rec["created"]]
+        if after:
+            g = min(after, key=lambda x: _epoch(x.get("createdAt") or ""))
+            rec["fixed"] = {"sha": (g.get("headSha") or "")[:7], "title": g.get("displayTitle") or "",
+                            "created": _epoch(g.get("createdAt") or ""), "id": str(g.get("databaseId") or "")}
+            changed = True
+    if changed:
+        _save_failures(cfg, store)
+    return store
+
+
+def failures_view(store, days=90):
+    """Newest first for the table, plus the tests that keep failing."""
+    now = time.time()
+    recs = sorted(store.get("runs", {}).values(), key=lambda r: -r.get("created", 0))
+    counts = {}
+    for r in recs:
+        if now - r.get("created", 0) > days * 86400:
+            continue
+        for t in r.get("tests") or []:
+            c = counts.setdefault(t["id"], {"id": t["id"], "runs": 0, "last": 0, "fixed": True})
+            c["runs"] += 1
+            c["last"] = max(c["last"], r.get("created", 0))
+            if not r.get("fixed"):
+                c["fixed"] = False
+    repeats = sorted([c for c in counts.values() if c["runs"] >= 2],
+                     key=lambda c: (-c["runs"], -c["last"]))
+    return recs[:40], repeats[:15]
+
+
+_fail_last = 0.0
+
+
+def failure_watch_loop():
+    """Its own thread: a poll can read a few megabytes of log."""
+    global _fail_last
+    while True:
+        try:
+            for root in repo_list():
+                cfg = repo_config(root)
+                collect_failures(root, cfg)
+            _fail_last = time.time()
+        except Exception:
+            pass
+        time.sleep(FAIL_POLL_SECONDS)
+
+
 RUNNER_GLOB = os.path.expanduser("~/actions-runner-*")
 RUNNER_CHECK_SECONDS = int(os.environ.get("VAKTIN_RUNNER_CHECK_SECONDS", "120"))
 RUNNER_REVIVE_COOLDOWN = 600
@@ -977,11 +1213,13 @@ def gather():
             if r["name"] not in seen_runners:
                 seen_runners.add(r["name"])
                 gh_runner_rows.append(r)
+        fails, repeats = failures_view(load_failures(cfg))
         projects.append({
             "name": cfg["name"], "root": root,
             "branches": branches(root, cfg), "releases": rel,
             "built_ok": ok, "built_why": _cloud_run_why, "runs": runs, "eta": eta,
             "note": cfg.get("note", ""),
+            "failures": fails, "repeats": repeats,
         })
     data = {"projects": projects, "sessions": sessions(roots),
             "runners": _runners, "github_runners": gh_runner_rows,
@@ -1030,6 +1268,9 @@ tr:last-child td{border-bottom:none}
 tr.prog{background:linear-gradient(90deg,rgba(55,71,143,.13) var(--pct),transparent var(--pct))}
 tr.over{background:rgba(154,99,0,.12)}
 .empty{padding:16px 14px;color:var(--muted)}
+/* the failing tests: one per line, monospace, clamped like any other prose */
+.pre{white-space:pre-line;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:11.5px}
+.c-ftests{max-width:38ch}
 .hint{margin-top:8px;font-size:12px;color:var(--muted)}
 .bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden;width:120px;display:inline-block;
      vertical-align:middle;margin-left:8px}
@@ -1102,6 +1343,17 @@ code{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;
  .c-run{grid-row:1;grid-column:1/3}
  .c-rstate{grid-row:1;grid-column:3;justify-self:end}
  .c-rnote{grid-row:2;grid-column:1/-1}
+ .c-fwhen{grid-row:1;grid-column:1}
+ .c-fjob{grid-row:1;grid-column:2}
+ .c-fref{grid-row:1;grid-column:3;justify-self:end;max-width:34vw}
+ .c-ftitle{grid-row:2;grid-column:1/-1}
+ .c-ftests{grid-row:3;grid-column:1/-1;max-width:none}
+ .c-ffix{grid-row:4;grid-column:1/-1}
+ .c-ffix::before{content:"lagað: ";color:var(--muted)}
+ .c-rtest{grid-row:1;grid-column:1/-1}
+ .c-rcount{grid-row:2;grid-column:1}
+ .c-rlast{grid-row:2;grid-column:2}
+ .c-rfix{grid-row:2;grid-column:3;justify-self:end}
  .c-evts{grid-row:1;grid-column:1}
  .c-evtx{grid-row:1;grid-column:2/-1}
  /* A three-line block tinted to 40% of its WIDTH reads as a column, not as
@@ -1303,6 +1555,9 @@ def project_section(p, multi):
                  '<code>cloud_run</code> í <code>.vaktin.json</code> — merki eru '
                  'sýnd án byggingarstöðu.</div>')
 
+    # failures — why a run failed, kept for as long as the page is
+    s.append(failures_section(p))
+
     # branches — what has NOT landed
     s.append('<h2>Greinar sem eru ekki komnar á main</h2><div class="card">')
     if p["branches"]:
@@ -1317,6 +1572,66 @@ def project_section(p, multi):
     else:
         s.append('<div class="empty">Allt komið á main.</div>')
     s.append("</div>")
+    return "".join(s)
+
+
+def failures_section(p):
+    s = ['<h2>Föll í prófunum — hvað féll og hvað lagaði það</h2><div class="card">']
+    fails = p.get("failures") or []
+    if not fails:
+        s.append('<div class="empty">Engin skráð föll.</div></div>')
+        return "".join(s)
+    s.append('<table class="stack"><tr class="hd"><th>Hvenær</th><th>Verk</th>'
+             "<th>Grein/merki</th><th>Hvað</th><th>Féll</th><th>Lagað</th></tr>")
+    for r in fails:
+        c = r.get("conclusion") or ""
+        kind = "bad" if c == "failure" else "warn"
+        tests = r.get("tests") or []
+        if r.get("blocked"):
+            what = f"GitHub ræsti aldrei {r['blocked']} verk (0 skref): kvóta- eða greiðslustopp, ekki bilað próf"
+        elif tests:
+            lines = []
+            for t in tests[:12]:
+                pr = f" [{', '.join(t['projects'])}]" if t.get("projects") else ""
+                lines.append(f"{t['id']}{pr}")
+            if len(tests) > 12:
+                lines.append(f"… og {len(tests) - 12} til viðbótar")
+            for e in (r.get("errors") or [])[:3]:
+                lines.append(f"→ {e}")
+            what = "\n".join(lines)
+        elif c == "cancelled":
+            what = f"hætt við eftir {r.get('mins', 0)} mín (tímaþak eða útrýming, sjá Útgáfur)"
+        else:
+            what = "; ".join((r.get("errors") or [])[:3]) or \
+                   ", ".join(j["name"] for j in (r.get("jobs") or [])[:4]) or "engin próf nefnd í loggnum"
+        head = (f"{len(tests)} próf" if tests else ("verk ræstust ekki" if r.get("blocked") else c))
+        fx = r.get("fixed")
+        if fx:
+            fixed = f'<span class="mono">{html.escape(fx["sha"])}</span> {clip(fx["title"], 1)}'
+        else:
+            fixed = pill("óleyst", "warn")
+        ref, rcls = r.get("branch") or "", "c-fref mono"
+        rcls += " ref-tag" if re.match(r"^v?\d+\.\d+", ref) else " muted"
+        s.append(f'<tr><td class="c-fwhen mono muted">{clock(r.get("created"))}</td>'
+                 f'<td class="c-fjob">{pill(head, kind)} {clip(r.get("workflow", ""), 1)}</td>'
+                 f'<td class="{rcls}">{clip(ref, 1)}</td>'
+                 f'<td class="c-ftitle muted">{clip(r.get("title", ""))}</td>'
+                 f'<td class="c-ftests"><span class="clip pre" tabindex="0" title="{html.escape(what)}">'
+                 f'{html.escape(what)}</span></td>'
+                 f'<td class="c-ffix">{fixed}</td></tr>')
+    s.append("</table></div>")
+    reps = p.get("repeats") or []
+    if reps:
+        s.append('<h2>Endurtekin föll, síðustu 90 daga</h2><div class="card"><table class="stack">'
+                 '<tr class="hd"><th>Próf</th><th>Keyrslur</th><th>Síðast</th><th></th></tr>')
+        for c in reps:
+            s.append(f'<tr><td class="c-rtest mono">{clip(c["id"])}</td>'
+                     f'<td class="c-rcount mono">{c["runs"]}×</td>'
+                     f'<td class="c-rlast muted">{clock(c["last"])}</td>'
+                     f'<td class="c-rfix">{pill("lagað", "ok") if c["fixed"] else pill("enn opið", "warn")}</td></tr>')
+        s.append("</table></div>")
+    s.append('<div class="hint">Lesið úr loggum keyrslanna þegar þær falla og geymt hér; '
+             'GitHub hendir loggunum eftir 90 daga.</div>')
     return "".join(s)
 
 
@@ -1429,4 +1744,5 @@ if __name__ == "__main__":
     for r in runner_installs():
         print(f"  watching runner {r['name']} ({r['label']})")
     threading.Thread(target=runner_watch_loop, daemon=True).start()
+    threading.Thread(target=failure_watch_loop, daemon=True).start()
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

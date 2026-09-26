@@ -26,6 +26,14 @@ Per watched repository:
 - **Útgáfur** — the last ten tags, each joined to what the deploy target really
   has: `komin út` (shipped), `drög` (built but draft — no device will take it),
   `ALDREI BYGGÐ` (**tagged and never built**), `byggist`, or `óþekkt`.
+- **Föll í prófunum** — every failed CI run, read once from its logs and kept
+  in a small JSON file per project (`~/.config/vaktin/failures/`): which tests
+  failed (Playwright, pytest and node lines are recognised; projects and retries
+  collapse into one entry), the first error lines, whether GitHub never started
+  the jobs at all, and the first green run that followed on the same branch,
+  which is what fixed it. GitHub deletes the logs after 90 days; this does not.
+  A second table lists the tests that failed in more than one run over the last
+  90 days, so a flaky or twice-broken test reads as one problem, not several.
 - **Greinar sem eru ekki komnar á main** — branches with commits that have not
   landed, oldest first, because the oldest is the one everyone has forgotten.
 
@@ -137,6 +145,15 @@ correct response is to **fix the tool**, not to work around it in prose.
 
 The JSON is the same structure the page renders: `projects[]` each with
 `releases[]`, `runs[]`, `branches[]`, plus a global `sessions[]`.
+
+## Tests
+
+```bash
+python3 -m unittest test_vaktin -v
+```
+
+Stdlib `unittest`, no watched repo, no network: the log parser, the failure
+store and the rendered sections with placeholder data.
 
 ## Requirements
 
