@@ -1847,9 +1847,12 @@ def page(d):
              f'<span class="stamp">uppfært {d["at"]} · sjálfvirkt á 20 s</span>')
     tl = tools()
     if tl:
-        s.append('<span class="tools">' + " ".join(
-            f'<a href="{html.escape(t["url"])}"{" title=\"aðeins á þessari vél\"" if t["local"] else ""}>'
-            f'{html.escape(t["name"])}{" ·" if t["local"] else ""}</a>' for t in tl) + '</span>')
+        links = []
+        for t in tl:
+            title = ' title="aðeins á þessari vél"' if t["local"] else ""
+            mark = " ·" if t["local"] else ""
+            links.append(f'<a href="{html.escape(t["url"])}"{title}>{html.escape(t["name"])}{mark}</a>')
+        s.append('<span class="tools">' + " ".join(links) + '</span>')
     s.append('</header>')
 
     if not d["configured"]:
