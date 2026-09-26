@@ -811,6 +811,111 @@ def _workflow_eta(root, workflow):
 # shows red — a runner that dies instantly every time needs a human, and a
 # kickstart loop would just hide that.
 
+# ── the office: what scheduled agent roles delivered, for review ─────────────
+# A directory of role reports (`reports/<role>/<stamp>.md`, first line DONE,
+# PARTIAL or BLOCKED), a weekly ledger (`ledger/<week>.json`, one entry per
+# run with its cost) and optional handoffs. Vaktin reads it, never writes it.
+# Generic: any tool that leaves reports in that shape can feed this panel.
+OFFICE_DIR = os.path.expanduser(os.environ.get("VAKTIN_OFFICE_DIR", "~/.config/agents-office"))
+
+
+def _office_week_key(now=None):
+    from datetime import datetime, timedelta, timezone
+    now = now or datetime.now(timezone.utc)
+    shifted = now - timedelta(hours=23)          # weeks reset Monday 23:00 UTC
+    return (shifted - timedelta(days=shifted.weekday())).strftime("%Y-%m-%d")
+
+
+def office_report(path):
+    """{"status", "needs", "text"} from one report file."""
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return None
+    lines = text.splitlines()
+    first = (lines[0].strip() if lines else "").upper()
+    status = first if first in ("DONE", "PARTIAL", "BLOCKED") else "?"
+    # the section for the human: the last heading that asks for them, else the tail
+    needs, take = [], False
+    for l in lines[1:]:
+        if l.startswith("#"):
+            take = any(w in l.lower() for w in ("þarf", "snorr", "needs", "ákvar", "decision"))
+            continue
+        if take and l.strip():
+            needs.append(l.strip())
+    if not needs:
+        needs = [l.strip() for l in lines[1:] if l.strip() and not l.startswith("#")][:4]
+    return {"status": status, "needs": " ".join(needs)[:600], "text": text[:6000]}
+
+
+def office_data():
+    """Per role: the newest report and this week's runs; plus the week's totals."""
+    rep = os.path.join(OFFICE_DIR, "reports")
+    if not os.path.isdir(rep):
+        return None
+    ledger = {}
+    try:
+        ledger = json.load(open(os.path.join(OFFICE_DIR, "ledger", f"{_office_week_key()}.json")))
+    except Exception:
+        pass
+    runs = ledger.get("runs") or []
+    roles = []
+    names = sorted(set(os.listdir(rep)) | {r.get("role") for r in runs if r.get("role")})
+    for role in names:
+        if not role or role.startswith("."):
+            continue
+        d = os.path.join(rep, role)
+        files = sorted(glob.glob(os.path.join(d, "*.md"))) if os.path.isdir(d) else []
+        last = office_report(files[-1]) if files else None
+        mine = [r for r in runs if r.get("role") == role]
+        stamp = os.path.basename(files[-1])[:-3].replace("_", " ") if files else ""
+        try:
+            last_ts = os.path.getmtime(files[-1]) if files else 0
+        except OSError:
+            last_ts = 0
+        roles.append({"role": role, "stamp": stamp, "last_ts": last_ts,
+                      "status": (last or {}).get("status", "—"),
+                      "needs": (last or {}).get("needs", ""), "text": (last or {}).get("text", ""),
+                      "runs": len(mine), "cost": round(sum(r.get("cost", 0.0) for r in mine), 2),
+                      "handoff": os.path.isfile(os.path.join(OFFICE_DIR, "handoffs", f"{role}.md")),
+                      "reports": len(files)})
+    roles.sort(key=lambda r: -r["last_ts"])
+    usage = ledger.get("usage") or {}
+    return {"roles": roles, "week": _office_week_key(),
+            "cost": round(sum(r.get("cost", 0.0) for r in runs), 2), "runs": len(runs),
+            "usage": usage, "dir": OFFICE_DIR}
+
+
+def office_section(o):
+    if not o:
+        return ""
+    s = ['<h2>Skrifstofan — hvað hlutverkin skiluðu</h2><div class="card">']
+    if not o["roles"]:
+        s.append('<div class="empty">Engar skýrslur enn.</div></div>')
+        return "".join(s)
+    s.append('<table class="stack"><tr class="hd"><th>Hlutverk</th><th>Staða</th><th>Síðast</th>'
+             "<th>Vika</th><th>Þarf þig</th></tr>")
+    K = {"DONE": ("ok", "lokið"), "PARTIAL": ("warn", "hálfnað"), "BLOCKED": ("bad", "fast"), "—": ("idle", "ekkert enn"), "?": ("idle", "óljóst")}
+    for r in o["roles"]:
+        kind, label = K.get(r["status"], ("idle", r["status"]))
+        full = html.escape(r["text"]) if r["text"] else ""
+        needs = (f'<span class="clip pre" tabindex="0" title="{full}">{html.escape(r["needs"] or "(ekkert nefnt)")}</span>'
+                 if r["text"] else '<span class="muted">engin skýrsla</span>')
+        week = f'{r["runs"]}× · {r["cost"]:.2f} USD' if r["runs"] else "hvílir"
+        mark = ' <span class="muted" title="verkefni bíður">·</span>' if r["handoff"] else ""
+        s.append(f'<tr><td class="c-orole mono">{html.escape(r["role"])}{mark}</td>'
+                 f'<td class="c-ostate">{pill(label, kind)}</td>'
+                 f'<td class="c-owhen mono muted">{clock(r["last_ts"]) if r["last_ts"] else "—"}</td>'
+                 f'<td class="c-oweek mono muted">{week}</td>'
+                 f'<td class="c-oneeds">{needs}</td></tr>')
+    s.append("</table></div>")
+    u = o.get("usage") or {}
+    note = (f' · /usage {u["all"]}% (Fable {u["fable"]}%)' if u.get("all") is not None else "")
+    s.append(f'<div class="hint">Vika {o["week"]}: {o["runs"]} keyrslur, {o["cost"]:.2f} USD{note}. '
+             f'Skýrslurnar í heild: <code>{html.escape(o["dir"])}/reports/</code>; kóðinn í greinum <code>office/*</code> hér að neðan.</div>')
+    return "".join(s)
+
+
 # ── failures: why a run failed, kept past GitHub's log retention ─────────────
 # A failed gate tells you WHICH tests failed for as long as GitHub keeps the log
 # (90 days), and then only if you open the run. Nothing joins them: the same
@@ -1223,6 +1328,7 @@ def gather():
         })
     data = {"projects": projects, "sessions": sessions(roots),
             "runners": _runners, "github_runners": gh_runner_rows,
+            "office": office_data(),
             "configured": bool(roots), "at": time.strftime("%H:%M:%S")}
     _cache.update(at=time.time(), data=data)
     return data
@@ -1271,6 +1377,7 @@ tr.over{background:rgba(154,99,0,.12)}
 /* the failing tests: one per line, monospace, clamped like any other prose */
 .pre{white-space:pre-line;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:11.5px}
 .c-ftests{max-width:38ch}
+.c-oneeds{max-width:52ch}
 .hint{margin-top:8px;font-size:12px;color:var(--muted)}
 .bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden;width:120px;display:inline-block;
      vertical-align:middle;margin-left:8px}
@@ -1343,6 +1450,11 @@ code{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;
  .c-run{grid-row:1;grid-column:1/3}
  .c-rstate{grid-row:1;grid-column:3;justify-self:end}
  .c-rnote{grid-row:2;grid-column:1/-1}
+ .c-orole{grid-row:1;grid-column:1}
+ .c-ostate{grid-row:1;grid-column:2;justify-self:start}
+ .c-owhen{grid-row:1;grid-column:3;justify-self:end}
+ .c-oweek{grid-row:2;grid-column:1/-1}
+ .c-oneeds{grid-row:3;grid-column:1/-1}
  .c-fwhen{grid-row:1;grid-column:1}
  .c-fjob{grid-row:1;grid-column:2}
  .c-fref{grid-row:1;grid-column:3;justify-self:end;max-width:34vw}
@@ -1686,6 +1798,9 @@ def page(d):
                      f'<td colspan=2 class="c-evtx muted">{html.escape(e["runner"])}: '
                      f'{html.escape(e["action"])}</td></tr>')
         s.append("</table></div>")
+
+    # what the scheduled roles delivered, above the projects: it is what you review
+    s.append(office_section(d.get("office")))
 
     multi = len(d["projects"]) > 1
     for p in d["projects"]:

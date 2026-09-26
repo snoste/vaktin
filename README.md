@@ -37,6 +37,15 @@ Per watched repository:
 - **Greinar sem eru ekki komnar á main** — branches with commits that have not
   landed, oldest first, because the oldest is the one everyone has forgotten.
 
+And, when a directory of agent reports exists (`VAKTIN_OFFICE_DIR`, default
+`~/.config/agents-office`):
+
+- **Skrifstofan** — what each scheduled role delivered: its last report's verdict
+  (DONE / PARTIAL / BLOCKED), when, this week's runs and cost, and the part of
+  the report that needs a human, with the whole report one tap away. Read-only;
+  any tool that leaves `reports/<role>/<stamp>.md` files with that first line
+  and a `ledger/<week>.json` of runs can feed it.
+
 And once, globally:
 
 - **Lotur í gangi** — live coding sessions, which repo and branch each is on.

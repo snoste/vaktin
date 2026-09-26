@@ -3,6 +3,7 @@
     python3 -m unittest test_vaktin -v
 """
 import importlib.util
+import json
 import os
 import tempfile
 import time
@@ -89,6 +90,34 @@ class TestView(unittest.TestCase):
         for needle in ("1 próf", "óleyst", "GitHub ræsti aldrei 5 verk", "0123abc", "3×", "enn opið", "c-ftests"):
             self.assertIn(needle, h)
         self.assertIn("Engin skráð föll", v.failures_section({"failures": []}))
+
+
+class TestOffice(unittest.TestCase):
+    def test_reads_reports_and_the_week_ledger(self):
+        with tempfile.TemporaryDirectory() as d:
+            v.OFFICE_DIR = d
+            os.makedirs(os.path.join(d, "reports", "gardener")); os.makedirs(os.path.join(d, "ledger")); os.makedirs(os.path.join(d, "handoffs"))
+            open(os.path.join(d, "reports", "gardener", "2026-01-05_0300.md"), "w").write(
+                "DONE\n# gardener\n## What I did\nfixed a test\n## Needs you\nmerge PR 12\n")
+            open(os.path.join(d, "reports", "gardener", "2026-01-06_0300.md"), "w").write(
+                "BLOCKED\n# gardener\n## Hvað ég gerði\nread only\n## Þarf Snorra\nallow bash\nand more\n")
+            open(os.path.join(d, "handoffs", "gardener.md"), "w").write("go")
+            open(os.path.join(d, "ledger", f"{v._office_week_key()}.json"), "w").write(json.dumps(
+                {"runs": [{"role": "gardener", "cost": 1.5}, {"role": "gardener", "cost": 0.5}, {"role": "lead", "cost": 0.25}],
+                 "usage": {"all": 37, "fable": 61, "ts": 0}}))
+            o = v.office_data()
+            g = [r for r in o["roles"] if r["role"] == "gardener"][0]
+            self.assertEqual((g["status"], g["needs"], g["runs"], g["cost"], g["handoff"], g["reports"]),
+                             ("BLOCKED", "allow bash and more", 2, 2.0, True, 2))
+            lead = [r for r in o["roles"] if r["role"] == "lead"][0]        # in the ledger, no report yet
+            self.assertEqual((lead["status"], lead["runs"]), ("—", 1))
+            self.assertEqual((o["cost"], o["runs"], o["usage"]["all"]), (2.25, 3, 37))
+            h = v.office_section(o)
+            for needle in ("Skrifstofan", "fast", "allow bash", "2× · 2.00 USD", "/usage 37%", "ekkert enn"):
+                self.assertIn(needle, h)
+        v.OFFICE_DIR = "/nonexistent-office"
+        self.assertIsNone(v.office_data())
+        self.assertEqual(v.office_section(None), "")
 
 
 if __name__ == "__main__":
