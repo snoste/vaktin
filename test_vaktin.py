@@ -124,6 +124,8 @@ class TestRunnerAlerts(unittest.TestCase):
     def test_alert_after_sustained_offline_and_on_recovery(self):
         sent = []
         v._runner_seen.clear()
+        real = v.send_alert
+        self.addCleanup(setattr, v, "send_alert", real)
         v.send_alert = lambda m: sent.append(m) or True
         v.watch_github_runners([{"name": "box", "online": False, "busy": False}])
         self.assertEqual(sent, [])                                    # one tick is a restart, not an outage
