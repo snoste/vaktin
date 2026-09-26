@@ -1414,6 +1414,8 @@ body{margin:0;background:var(--bg);color:var(--ink);
 header{display:flex;align-items:baseline;gap:14px;margin-bottom:22px}
 h1{font-size:20px;margin:0;letter-spacing:-.01em}
 .stamp{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted)}
+.tools{margin-left:auto;display:flex;flex-wrap:wrap;gap:6px}
+.tools a{font-size:12px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:2px 10px;background:var(--card)}
 h2{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);
    margin:26px 0 10px;font-weight:600}
 h3{font-size:15px;margin:34px 0 4px;letter-spacing:-.01em}
@@ -1816,10 +1818,39 @@ def failures_section(p):
     return "".join(s)
 
 
+# Other pages of the same watch, listed in the header: "name = url" lines in
+# ~/.config/vaktin/tools (or VAKTIN_TOOLS, ";"-separated). A url on 127.0.0.1
+# is marked as reachable from this machine only.
+TOOLS_FILE = os.path.join(CONFIG_HOME, "tools")
+
+
+def tools():
+    raw = os.environ.get("VAKTIN_TOOLS", "").strip()
+    lines = raw.split(";") if raw else []
+    if not lines:
+        try:
+            lines = open(TOOLS_FILE).read().splitlines()
+        except OSError:
+            lines = []
+    out = []
+    for l in lines:
+        if "=" in l and not l.strip().startswith("#"):
+            name, url = l.split("=", 1)
+            out.append({"name": name.strip(), "url": url.strip(),
+                        "local": "127.0.0.1" in url or "localhost" in url})
+    return out
+
+
 def page(d):
     s = []
     s.append('<div class="wrap"><header><h1>Vaktin</h1>'
-             f'<span class="stamp">uppfært {d["at"]} · sjálfvirkt á 20 s</span></header>')
+             f'<span class="stamp">uppfært {d["at"]} · sjálfvirkt á 20 s</span>')
+    tl = tools()
+    if tl:
+        s.append('<span class="tools">' + " ".join(
+            f'<a href="{html.escape(t["url"])}"{" title=\"aðeins á þessari vél\"" if t["local"] else ""}>'
+            f'{html.escape(t["name"])}{" ·" if t["local"] else ""}</a>' for t in tl) + '</span>')
+    s.append('</header>')
 
     if not d["configured"]:
         s.append('<div class="card"><div class="empty">'

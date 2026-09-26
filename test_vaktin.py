@@ -120,6 +120,18 @@ class TestOffice(unittest.TestCase):
         self.assertEqual(v.office_section(None), "")
 
 
+class TestTools(unittest.TestCase):
+    def test_tools_from_env_and_local_mark(self):
+        os.environ["VAKTIN_TOOLS"] = "Desk=https://desk.example:8788/;Colony=http://127.0.0.1:5274/"
+        try:
+            tl = v.tools()
+        finally:
+            os.environ.pop("VAKTIN_TOOLS", None)
+        self.assertEqual([(t["name"], t["local"]) for t in tl], [("Desk", False), ("Colony", True)])
+        h = v.page({"projects": [], "configured": False, "at": "1", "sessions": [], "runners": {"list": [], "events": []}})
+        self.assertIn("Vaktin", h)
+
+
 class TestRunnerAlerts(unittest.TestCase):
     def test_alert_after_sustained_offline_and_on_recovery(self):
         sent = []
