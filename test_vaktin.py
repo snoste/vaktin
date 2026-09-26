@@ -120,5 +120,25 @@ class TestOffice(unittest.TestCase):
         self.assertEqual(v.office_section(None), "")
 
 
+class TestRunnerAlerts(unittest.TestCase):
+    def test_alert_after_sustained_offline_and_on_recovery(self):
+        sent = []
+        v._runner_seen.clear()
+        v.send_alert = lambda m: sent.append(m) or True
+        v.watch_github_runners([{"name": "box", "online": False, "busy": False}])
+        self.assertEqual(sent, [])                                    # one tick is a restart, not an outage
+        v.watch_github_runners([{"name": "box", "online": False, "busy": False}])
+        self.assertEqual(len(sent), 1); self.assertIn("AFTENGDUR", sent[0])
+        v.watch_github_runners([{"name": "box", "online": False, "busy": False}])
+        self.assertEqual(len(sent), 1)                                # once, not every tick
+        v.watch_github_runners([{"name": "box", "online": True, "busy": False}])
+        self.assertEqual(len(sent), 2); self.assertIn("aftur", sent[1])
+
+    def test_no_command_means_no_alert(self):
+        v.ALERT_CMD_FILE = "/nonexistent/alert-cmd"
+        os.environ.pop("VAKTIN_ALERT_CMD", None)
+        self.assertFalse(v.send_alert("x"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1152,6 +1152,61 @@ def failure_watch_loop():
         time.sleep(FAIL_POLL_SECONDS)
 
 
+# ── alerts: a runner registered with GitHub goes offline, or comes back ──────
+# The command is read from VAKTIN_ALERT_CMD, else from ~/.config/vaktin/alert-cmd
+# (one shell line; the message arrives on stdin and as $VAKTIN_MSG). Nothing is
+# sent when neither exists. Two consecutive ticks offline (~4 min) before the
+# first alert, so a runner's own restart does not page anyone.
+ALERT_CMD_FILE = os.path.join(CONFIG_HOME, "alert-cmd")
+ALERT_AFTER_TICKS = 2
+_runner_seen = {}                # runner name → {"off": ticks offline, "alerted": bool}
+
+
+def alert_cmd():
+    cmd = os.environ.get("VAKTIN_ALERT_CMD", "").strip()
+    if cmd:
+        return cmd
+    try:
+        return open(ALERT_CMD_FILE).read().strip()
+    except OSError:
+        return ""
+
+
+def send_alert(msg):
+    cmd = alert_cmd()
+    if not cmd:
+        return False
+    try:
+        env = dict(os.environ, VAKTIN_MSG=msg)
+        subprocess.run(cmd, shell=True, input=msg, text=True, timeout=20, env=env,
+                       capture_output=True)
+        return True
+    except Exception as e:
+        logger_note = f"alert failed: {e}"
+        _runners["events"].insert(0, {"ts": time.strftime("%H:%M:%S"), "runner": "vaktin", "action": logger_note})
+        return False
+
+
+def watch_github_runners(rows):
+    """Called every tick with gh_runners() rows: alert on offline (sustained) and on recovery."""
+    for r in rows:
+        st = _runner_seen.setdefault(r["name"], {"off": 0, "alerted": False})
+        if r["online"]:
+            if st["alerted"]:
+                send_alert(f"Keyrarinn {r['name']} er kominn aftur á línuna.")
+                _runners["events"].insert(0, {"ts": time.strftime("%H:%M:%S"), "runner": r["name"], "action": "kominn aftur á línuna (tilkynnt)"})
+            st.update(off=0, alerted=False)
+            continue
+        st["off"] += 1
+        if st["off"] >= ALERT_AFTER_TICKS and not st["alerted"]:
+            st["alerted"] = True
+            sent = send_alert(f"Keyrarinn {r['name']} er AFTENGDUR frá GitHub (í {st['off'] * RUNNER_CHECK_SECONDS // 60} mín). "
+                              "Ef þetta er vélin með snjalltengilinn: slökkva, bíða 10 s, kveikja.")
+            _runners["events"].insert(0, {"ts": time.strftime("%H:%M:%S"), "runner": r["name"],
+                                          "action": "aftengdur frá GitHub" + (" (tilkynnt)" if sent else " (engin tilkynningarleið stillt)")})
+    del _runners["events"][20:]
+
+
 RUNNER_GLOB = os.path.expanduser("~/actions-runner-*")
 RUNNER_CHECK_SECONDS = int(os.environ.get("VAKTIN_RUNNER_CHECK_SECONDS", "120"))
 RUNNER_REVIVE_COOLDOWN = 600
@@ -1247,7 +1302,8 @@ def runner_watch_loop():
         # Keep the picture fresh even with no browser open — the stall check
         # reads the same cache the page does.
         try:
-            gather()
+            data = gather()
+            watch_github_runners(data.get("github_runners") or [])
         except Exception:
             pass
         # Stale-idle revival: sustained queued-but-nothing-running revives every

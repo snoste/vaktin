@@ -155,6 +155,14 @@ correct response is to **fix the tool**, not to work around it in prose.
 The JSON is the same structure the page renders: `projects[]` each with
 `releases[]`, `runs[]`, `branches[]`, plus a global `sessions[]`.
 
+## Alerts
+
+A runner registered with GitHub that stays offline for two checks (about four
+minutes) triggers one alert, and its return triggers another. The alert is a shell
+line of your own in `~/.config/vaktin/alert-cmd` (or `VAKTIN_ALERT_CMD`), run with
+the message on stdin and in `$VAKTIN_MSG`; a phone push through a topic on
+ntfy.sh is one line of `curl`. No file, no alerts.
+
 ## Tests
 
 ```bash
