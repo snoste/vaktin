@@ -113,7 +113,7 @@ class TestOffice(unittest.TestCase):
             self.assertEqual((lead["status"], lead["runs"]), ("—", 1))
             self.assertEqual((o["cost"], o["runs"], o["usage"]["all"]), (2.25, 3, 37))
             h = v.office_section(o)
-            for needle in ("Skrifstofan", "fast", "allow bash", "2× · 2.00 USD", "/usage 37%", "ekkert enn"):
+            for needle in ("Skrifstofan", "fast", "allow bash", "2× · 2.00 USD", "/usage 37%", "ekkert enn", "skrifstofuborðið"):
                 self.assertIn(needle, h)
         v.OFFICE_DIR = "/nonexistent-office"
         self.assertIsNone(v.office_data())

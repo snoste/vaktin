@@ -817,6 +817,9 @@ def _workflow_eta(root, workflow):
 # run with its cost) and optional handoffs. Vaktin reads it, never writes it.
 # Generic: any tool that leaves reports in that shape can feed this panel.
 OFFICE_DIR = os.path.expanduser(os.environ.get("VAKTIN_OFFICE_DIR", "~/.config/agents-office"))
+# The desk that answers the roles (a separate page): linked from the panel's heading so
+# the phone finds it from here. Empty = no link. A port means "this host, that port".
+OFFICE_DESK = os.environ.get("VAKTIN_OFFICE_DESK", "8788").strip()
 
 
 def _office_week_key(now=None):
@@ -889,7 +892,11 @@ def office_data():
 def office_section(o):
     if not o:
         return ""
-    s = ['<h2>Skrifstofan — hvað hlutverkin skiluðu</h2><div class="card">']
+    link = ""
+    if OFFICE_DESK:
+        href = OFFICE_DESK if "/" in OFFICE_DESK else f'javascript:location.href=location.protocol+"//"+location.hostname+":{html.escape(OFFICE_DESK)}/"'
+        link = f' <a class="desk" href=\'{href}\'>opna skrifstofuborðið, svara þar →</a>'
+    s = [f'<h2>Skrifstofan — hvað hlutverkin skiluðu{link}</h2><div class="card">']
     if not o["roles"]:
         s.append('<div class="empty">Engar skýrslur enn.</div></div>')
         return "".join(s)
@@ -1430,6 +1437,7 @@ tr:last-child td{border-bottom:none}
 tr.prog{background:linear-gradient(90deg,rgba(55,71,143,.13) var(--pct),transparent var(--pct))}
 tr.over{background:rgba(154,99,0,.12)}
 .empty{padding:16px 14px;color:var(--muted)}
+h2 a.desk{text-transform:none;letter-spacing:0;font-weight:600;color:var(--accent);margin-left:10px;text-decoration:none}
 /* the failing tests: one per line, monospace, clamped like any other prose */
 .pre{white-space:pre-line;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:11.5px}
 .c-ftests{max-width:38ch}
