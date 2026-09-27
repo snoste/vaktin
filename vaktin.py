@@ -53,6 +53,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1367,6 +1368,256 @@ def _wait_alive(rdir, tries=10):
     return False
 
 
+# ── runner power ──────────────────────────────────────────────────────────────
+# How much machine stands behind each self-hosted runner, next to the runner
+# GitHub would lend you. One small test, the same everywhere: compress a fixed
+# megabyte with zlib for a second and a half, on one core and then on all of
+# them. It is a yardstick, not a benchmark suite; what matters is that every
+# box ran the identical thing, so the ratios mean something.
+#
+# Where a runner's machine is measured comes from ~/.config/vaktin/runner-hosts
+# (or VAKTIN_RUNNER_HOSTS, ";"-separated), one line per runner:
+#     <runner name> = <ssh target>        measured over ssh (python3 on the far side)
+# Runners installed on THIS machine (~/actions-runner-*) need no line. The
+# hosted runner's numbers come from this repository's own `bench` workflow.
+# A machine is measured at most once a day, and never while one of its runners
+# is busy: the test would steal from the job and the job from the test.
+BENCH_SRC = r"""
+import json, os, platform, subprocess, sys, threading, time, zlib
+def buf():
+    x, out = 12345, bytearray()
+    while len(out) < 1 << 20:
+        x = (x * 1103515245 + 12345) & 0x7fffffff
+        out += b"%d " % (x % 9973)
+    return bytes(out[:1 << 20])
+def work(data, seconds, box):
+    end, n = time.time() + seconds, 0
+    while time.time() < end:
+        zlib.compress(data, 6); n += 1
+    box.append(n)
+def score(data, threads, seconds=1.5):
+    box, t0 = [], time.time()
+    ts = [threading.Thread(target=work, args=(data, seconds, box)) for _ in range(threads)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    return round(sum(box) / (time.time() - t0), 1)
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+cpu, ram = "", 0
+if sys.platform == "darwin":
+    cpu = sh(["sysctl", "-n", "machdep.cpu.brand_string"])
+    ram = int(sh(["sysctl", "-n", "hw.memsize"]) or 0) / 2 ** 30
+else:
+    try:
+        for l in open("/proc/cpuinfo"):
+            if l.startswith("model name"):
+                cpu = l.split(":", 1)[1].strip(); break
+        for l in open("/proc/meminfo"):
+            if l.startswith("MemTotal"):
+                ram = int(l.split()[1]) / 2 ** 20; break
+    except OSError:
+        pass
+cores = os.cpu_count() or 1
+data = buf()
+print("VAKTIN_BENCH " + json.dumps({"cores": cores, "ram_gb": round(ram, 1), "cpu": cpu or platform.processor(),
+      "os": platform.system(), "single": score(data, 1), "multi": score(data, cores)}))
+"""
+POWER_FILE = os.path.join(CONFIG_HOME, "runner-power.json")
+RUNNER_HOSTS_FILE = os.path.join(CONFIG_HOME, "runner-hosts")
+POWER_MAX_AGE = 24 * 3600
+POWER_CHECK_SECONDS = 1800
+BENCH_RE = re.compile(r"VAKTIN_BENCH (\{.*\})")
+_power_lock = threading.Lock()
+
+
+def parse_bench(text):
+    m = BENCH_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(1))
+        return d if d.get("multi") and d.get("cores") else None
+    except ValueError:
+        return None
+
+
+def runner_hosts():
+    """runner name → 'local' or an ssh target."""
+    hosts = {}
+    for d in glob.glob(RUNNER_GLOB):
+        try:
+            with open(os.path.join(d, ".runner"), encoding="utf-8-sig") as f:
+                name = json.load(f).get("agentName")
+            if name:
+                hosts[name] = "local"
+        except (OSError, ValueError):
+            pass
+    raw = os.environ.get("VAKTIN_RUNNER_HOSTS", "").strip()
+    lines = raw.split(";") if raw else []
+    if not lines:
+        try:
+            with open(RUNNER_HOSTS_FILE) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+    for l in lines:
+        if "=" in l and not l.strip().startswith("#"):
+            name, target = [x.strip() for x in l.split("=", 1)]
+            # a target is a word handed to ssh: nothing that could be read as an option
+            if name and target and not target.startswith("-") and not re.search(r"\s", target):
+                hosts[name] = target
+    return hosts
+
+
+def measure(target):
+    cmd = ([sys.executable, "-"] if target == "local" else
+           ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", target, "python3", "-"])
+    try:
+        p = subprocess.run(cmd, input=BENCH_SRC, capture_output=True, text=True, timeout=90)
+    except Exception:
+        return None
+    return parse_bench(p.stdout)
+
+
+def hosted_power():
+    """The newest result of this repository's own bench workflow on a hosted runner."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    rid = run(["gh", "run", "list", "--workflow", "bench.yml", "--status", "success", "--limit", "1",
+               "--json", "databaseId", "-q", ".[0].databaseId"], cwd=here)
+    if not rid or not rid.isdigit():
+        return None
+    return parse_bench(run(["gh", "run", "view", rid, "--log"], timeout=60, cwd=here))
+
+
+def load_power():
+    try:
+        with open(POWER_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_power(store):
+    try:
+        os.makedirs(CONFIG_HOME, exist_ok=True)
+        tmp = POWER_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(store, f, indent=1)
+        os.replace(tmp, POWER_FILE)
+    except OSError:
+        pass
+
+
+def refresh_power(rows, now=None, measure_fn=None, hosted_fn=None):
+    """Measure what is due. `rows` are gh_runners() rows; returns the store."""
+    now = now or time.time()
+    measure_fn, hosted_fn = measure_fn or measure, hosted_fn or hosted_power
+    with _power_lock:
+        store = load_power()
+        machines = store.setdefault("machines", {})
+        hosts = runner_hosts()
+        busy = {hosts[r["name"]] for r in rows if r.get("busy") and r["name"] in hosts}
+        live = {hosts[r["name"]] for r in rows if r.get("online") and r["name"] in hosts}
+        changed = False
+        for target in sorted(live - busy):
+            if now - (machines.get(target) or {}).get("at", 0) < POWER_MAX_AGE:
+                continue
+            got = measure_fn(target)
+            if got:
+                machines[target] = dict(got, at=int(now)); changed = True
+            else:                      # say so once a day, keep the old numbers
+                machines[target] = dict(machines.get(target) or {}, at=int(now), failed=True); changed = True
+        if now - (store.get("hosted") or {}).get("at", 0) >= POWER_MAX_AGE:
+            got = hosted_fn()
+            store["hosted"] = dict(got or {k: v for k, v in (store.get("hosted") or {}).items() if k != "at"}, at=int(now))
+            changed = True
+        if changed:
+            save_power(store)
+        return store
+
+
+def power_view(rows, store, hosts=None):
+    """One row per machine with its runners, scaled to the strongest, and a
+    ratio against the hosted runner. Runners nobody can measure are named."""
+    hosts = runner_hosts() if hosts is None else hosts
+    hosted = store.get("hosted") or {}
+    machines, loose = {}, []
+    for r in rows:
+        target = hosts.get(r["name"])
+        m = (store.get("machines") or {}).get(target) if target else None
+        if not m or not m.get("multi"):
+            loose.append(r["name"])
+            continue
+        e = machines.setdefault(target, dict(m, runners=[], online=False, busy=False))
+        e["runners"].append(r["name"])
+        e["online"] = e["online"] or r["online"]
+        e["busy"] = e["busy"] or r["busy"]
+    top = max([m["multi"] for m in machines.values()] + [hosted.get("multi") or 0, 1])
+    out = []
+    for m in sorted(machines.values(), key=lambda m: -m["multi"]):
+        m["pct"] = round(100.0 * m["multi"] / top, 1)
+        m["x"] = round(m["multi"] / hosted["multi"], 1) if hosted.get("multi") else None
+        m["x1"] = round(m["single"] / hosted["single"], 1) if hosted.get("single") and m.get("single") else None
+        out.append(m)
+    ref = dict(hosted, pct=round(100.0 * hosted["multi"] / top, 1)) if hosted.get("multi") else None
+    return {"machines": out, "hosted": ref, "loose": loose}
+
+
+def power_loop():
+    time.sleep(20)                     # let the first page render before spending cores
+    while True:
+        try:
+            rows = (gather().get("github_runners") or [])
+            if rows:
+                refresh_power(rows)
+        except Exception:
+            pass
+        time.sleep(POWER_CHECK_SECONDS)
+
+
+def num(x):
+    """1.5 → '1,5', 2.0 → '2': Icelandic decimal comma, no trailing zero."""
+    s = ("%.1f" % x).rstrip("0").rstrip(".")
+    return s.replace(".", ",")
+
+
+def power_html(pw):
+    h = pw.get("hosted")
+    mark = '<i class="pw-mark" style="left:{}%"></i>'.format(h["pct"]) if h else ""
+    s = ['<div class="card pw"><div class="pw-hd"><b>Afl keyrara</b><span class="muted">'
+         "sama þjöppunarpróf á hverri vél, allir kjarnar"
+         + (", strikið er keyrari frá GitHub" if h else "") + "</span></div>"]
+
+    def spec(m):
+        bits = [m.get("cpu") or "", "{} kjarnar".format(m["cores"])]
+        if m.get("ram_gb"):
+            bits.append("{} GB".format(int(round(m["ram_gb"]))))
+        return " · ".join(b for b in bits if b)
+
+    for m in pw["machines"]:
+        cls = "pw-row" + ("" if m["online"] else " off") + (" busy" if m["busy"] else "")
+        big = (num(m["x"]) + "×") if m.get("x") else num(m["multi"])
+        small = ("einn kjarni " + num(m["x1"]) + "×") if m.get("x1") else "MB/s"
+        state = "" if m["online"] else " · aftengdur"
+        s.append(f'<div class="{cls}"><div class="pw-name"><span class="mono">{html.escape(", ".join(m["runners"]))}</span> '
+                 f'<span class="muted">{html.escape(spec(m))}{state}</span></div>'
+                 f'<div class="pw-bar"><i class="pw-fill" style="width:{m["pct"]}%"></i>{mark}</div>'
+                 f'<div class="pw-x"><b>{big}</b><span class="muted">{small}</span></div></div>')
+    if h:
+        s.append(f'<div class="pw-row ref"><div class="pw-name"><span class="mono">GitHub</span> '
+                 f'<span class="muted">{html.escape(spec(h))} · ubuntu-latest á opnu verkefni; lokuð verkefni fá helming kjarnanna</span></div>'
+                 f'<div class="pw-bar"><i class="pw-fill" style="width:{h["pct"]}%"></i></div>'
+                 f'<div class="pw-x"><b>1×</b><span class="muted">viðmið</span></div></div>')
+    if pw.get("loose"):
+        s.append('<div class="pw-note muted">Ómælt: <span class="mono">' + html.escape(", ".join(pw["loose"]))
+                 + '</span>. Lína í <code>~/.config/vaktin/runner-hosts</code> (<code>nafn = notandi@vél</code>) mælir vélina yfir ssh.</div>')
+    s.append("</div>")
+    return "".join(s)
+
+
 _cache = {"at": 0, "data": None}
 
 
@@ -1397,6 +1648,7 @@ def gather():
     data = {"projects": projects, "sessions": sessions(roots),
             "runners": _runners, "github_runners": gh_runner_rows,
             "office": office_data(),
+            "power": power_view(gh_runner_rows, load_power()),
             "configured": bool(roots), "at": time.strftime("%H:%M:%S")}
     _cache.update(at=time.time(), data=data)
     return data
@@ -1545,6 +1797,29 @@ code{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;
  table.stack tr.prog::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;
    background:linear-gradient(90deg,var(--accent) var(--pct),var(--line) var(--pct))}
 }
+.pw{padding:14px 16px;margin-top:10px}
+.pw-hd{display:flex;gap:4px 10px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px;font-size:12.5px}
+.pw-hd b{font-size:14px}
+.pw-row{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:3px 12px;align-items:center;padding:9px 0;border-top:1px solid var(--line)}
+.pw-name{grid-column:1/3;font-size:12.5px;overflow-wrap:anywhere}
+.pw-bar{position:relative;height:14px;border-radius:999px;background:rgba(55,71,143,.10);overflow:hidden}
+.pw-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;overflow:hidden;
+         background:linear-gradient(90deg,#37478f,#6f7fe0 55%,#8fd3ff);box-shadow:0 0 10px rgba(111,127,224,.55)}
+.pw-fill::after{content:"";position:absolute;inset:0;transform:translateX(-100%);
+                background:linear-gradient(100deg,transparent 30%,rgba(255,255,255,.6) 50%,transparent 70%);
+                animation:pw-sweep 3.4s ease-in-out infinite}
+.pw-row.busy .pw-fill{background:linear-gradient(90deg,#9a6300,#e0a23a 55%,#ffe08a);box-shadow:0 0 10px rgba(224,162,58,.6)}
+.pw-row.busy .pw-fill::after{animation-duration:.9s}
+.pw-row.off .pw-fill,.pw-row.ref .pw-fill{background:var(--muted);box-shadow:none;opacity:.45}
+.pw-row.off .pw-fill::after,.pw-row.ref .pw-fill::after{animation:none}
+.pw-mark{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:var(--ink);opacity:.7}
+.pw-x{display:flex;flex-direction:column;align-items:flex-end;line-height:1.15;font-variant-numeric:tabular-nums}
+.pw-x b{font-size:17px;letter-spacing:-.01em}.pw-x span{font-size:10.5px;white-space:nowrap}
+.pw-note{font-size:12px;padding-top:9px;border-top:1px solid var(--line)}
+body.first .pw-fill{animation:pw-grow 1.3s cubic-bezier(.2,.8,.2,1) both}
+@keyframes pw-sweep{to{transform:translateX(100%)}}
+@keyframes pw-grow{from{width:0}}
+@media (prefers-reduced-motion:reduce){.pw-fill,.pw-fill::after{animation:none!important}}
 @media (prefers-color-scheme:dark){
  :root{--bg:#0f1116;--card:#171a21;--ink:#e8eaf0;--muted:#8c93a6;--line:#252a35;--accent:#8f9ddb}
  .p-ok{background:#12301f;color:#5fce93}.p-bad{background:#3a1512;color:#f2938a}
@@ -1588,6 +1863,8 @@ JS = ("<script>document.addEventListener('click',e=>{"
       "row.style.setProperty('--pct',Math.min(100,100*(tot-left)/tot).toFixed(1)+'%');}"
       "else{row.classList.remove('prog');row.classList.add('over');}}});"
       "},1000);"
+      "document.body.classList.add('first');"
+      "setTimeout(()=>document.body.classList.remove('first'),1600);"
       "setInterval(async()=>{"
       "try{const r=await fetch('/',{cache:'no-store'});"
       "const d=new DOMParser().parseFromString(await r.text(),'text/html');"
@@ -1880,6 +2157,10 @@ def page(d):
                      f'<td class="c-rnote muted">{clip(r.get("labels",""), 1)}</td></tr>')
         s.append("</table></div>")
 
+    pw = d.get("power") or {}
+    if pw.get("machines"):
+        s.append(power_html(pw))
+
     # CI runners on THIS machine — watched and self-healed (see runner_watch_loop)
     rn = d.get("runners") or {}
     if rn.get("list"):
@@ -1956,6 +2237,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if "--bench" in sys.argv:          # the yardstick alone: what the bench workflow runs
+        exec(BENCH_SRC)
+        sys.exit(0)
     print(f"Vaktin → http://localhost:{PORT}   (Ctrl-C to stop)")
     for r in repo_list():
         print(f"  watching {r}")
@@ -1963,4 +2247,5 @@ if __name__ == "__main__":
         print(f"  watching runner {r['name']} ({r['label']})")
     threading.Thread(target=runner_watch_loop, daemon=True).start()
     threading.Thread(target=failure_watch_loop, daemon=True).start()
+    threading.Thread(target=power_loop, daemon=True).start()
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

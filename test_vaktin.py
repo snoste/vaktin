@@ -154,5 +154,61 @@ class TestRunnerAlerts(unittest.TestCase):
         self.assertFalse(v.send_alert("x"))
 
 
+class TestRunnerPower(unittest.TestCase):
+    ROWS = [{"name": "big", "online": True, "busy": False}, {"name": "big-2", "online": True, "busy": True},
+            {"name": "small", "online": False, "busy": False}, {"name": "unknown", "online": True, "busy": False}]
+    HOSTS = {"big": "u@a", "big-2": "u@a", "small": "u@b"}
+    STORE = {"machines": {"u@a": {"cores": 8, "ram_gb": 31.2, "cpu": "X", "single": 60.0, "multi": 300.0, "at": 1},
+                          "u@b": {"cores": 2, "ram_gb": 4, "cpu": "Y", "single": 20.0, "multi": 40.0, "at": 1}},
+             "hosted": {"cores": 4, "ram_gb": 15.6, "cpu": "H", "single": 40.0, "multi": 120.0, "at": 1}}
+
+    def test_a_bench_line_is_read_out_of_a_log(self):
+        line = '2026-01-01T00:00:00Z VAKTIN_BENCH {"cores": 4, "ram_gb": 15.6, "cpu": "c", "os": "Linux", "single": 41.5, "multi": 120.2}'
+        self.assertEqual(v.parse_bench("noise\n" + line + "\nmore")["multi"], 120.2)
+        self.assertIsNone(v.parse_bench("nothing here"))
+        self.assertIsNone(v.parse_bench("VAKTIN_BENCH {broken"))
+
+    def test_runners_on_one_machine_share_a_row_and_a_ratio(self):
+        pw = v.power_view(self.ROWS, self.STORE, self.HOSTS)
+        first, second = pw["machines"]
+        self.assertEqual(first["runners"], ["big", "big-2"])
+        self.assertTrue(first["busy"] and first["online"])
+        self.assertEqual((first["x"], first["x1"], first["pct"]), (2.5, 1.5, 100.0))
+        self.assertFalse(second["online"])
+        self.assertEqual(pw["hosted"]["pct"], 40.0)
+        self.assertEqual(pw["loose"], ["unknown"])
+        page = v.power_html(pw)
+        self.assertIn("2,5×", page)
+        self.assertIn("unknown", page)
+
+    def test_a_busy_or_fresh_machine_is_left_alone(self):
+        asked = []
+        old = (v.load_power, v.save_power, v.runner_hosts)
+        store = {"machines": {"u@b": {"multi": 40.0, "cores": 2, "at": 10 ** 9}}, "hosted": {"multi": 1.0, "at": 10 ** 9}}
+        v.load_power, v.save_power, v.runner_hosts = (lambda: store), (lambda s: None), (lambda: dict(self.HOSTS, unknown="u@c"))
+        try:
+            rows = [dict(r, online=True) for r in self.ROWS]
+            out = v.refresh_power(rows, now=10 ** 9 + 60, measure_fn=lambda t: asked.append(t) or {"multi": 9.0, "cores": 1},
+                                  hosted_fn=lambda: self.fail("hosted is fresh"))
+        finally:
+            v.load_power, v.save_power, v.runner_hosts = old
+        self.assertEqual(asked, ["u@c"])          # u@a is busy, u@b was measured a moment ago
+        self.assertEqual(out["machines"]["u@c"]["multi"], 9.0)
+
+    def test_a_host_line_cannot_smuggle_an_ssh_option(self):
+        old = os.environ.get("VAKTIN_RUNNER_HOSTS")
+        os.environ["VAKTIN_RUNNER_HOSTS"] = "a = u@h; b = -oProxyCommand=x; c = u@h extra; # d = u@h"
+        try:
+            hosts = v.runner_hosts()
+        finally:
+            if old is None:
+                del os.environ["VAKTIN_RUNNER_HOSTS"]
+            else:
+                os.environ["VAKTIN_RUNNER_HOSTS"] = old
+        self.assertEqual(hosts.get("a"), "u@h")
+        self.assertNotIn("b", hosts)
+        self.assertNotIn("c", hosts)
+
+
 if __name__ == "__main__":
     unittest.main()

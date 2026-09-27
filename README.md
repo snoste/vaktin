@@ -163,6 +163,15 @@ line of your own in `~/.config/vaktin/alert-cmd` (or `VAKTIN_ALERT_CMD`), run wi
 the message on stdin and in `$VAKTIN_MSG`; a phone push through a topic on
 ntfy.sh is one line of `curl`. No file, no alerts.
 
+## Runner power
+
+Under the runner list, one bar per machine: how much it can do next to the runner GitHub would lend you. Every box runs the same small test (zlib over a fixed megabyte, one core and then all of them), so the ratios mean something even though the number itself is only a yardstick.
+
+- Runners installed on the machine Vaktin runs on are measured by themselves.
+- A runner elsewhere needs one line in `~/.config/vaktin/runner-hosts`: `<runner name> = <ssh target>`. The far side needs `python3` and a key that logs in without a prompt.
+- The reference comes from this repository's `bench` workflow on `ubuntu-latest`. Run it once (`gh workflow run bench.yml`); it repeats monthly. A public repository gets a 4-core hosted runner, a private one half of that.
+- A machine is measured at most once a day and never while one of its runners has a job. Results live in `~/.config/vaktin/runner-power.json`; delete the file to measure again.
+
 ## Tests
 
 ```bash

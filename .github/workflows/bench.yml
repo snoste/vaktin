@@ -1,0 +1,16 @@
+# The yardstick on a GitHub-hosted runner: the reference the runner power panel
+# compares self-hosted machines against. Vaktin reads the newest successful run.
+name: bench
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 1 * *"
+permissions:
+  contents: read
+jobs:
+  hosted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 vaktin.py --bench
