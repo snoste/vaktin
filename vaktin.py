@@ -1569,13 +1569,18 @@ def power_view(rows, store, hosts=None):
 def power_loop():
     time.sleep(20)                     # let the first page render before spending cores
     while True:
+        waiting = False
         try:
             rows = (gather().get("github_runners") or [])
             if rows:
-                refresh_power(rows)
+                store = refresh_power(rows)
+                hosts = runner_hosts()
+                # a machine that was busy on its first turn is asked again soon, not tomorrow
+                waiting = any(r["online"] and r["name"] in hosts
+                              and not (store.get("machines") or {}).get(hosts[r["name"]]) for r in rows)
         except Exception:
             pass
-        time.sleep(POWER_CHECK_SECONDS)
+        time.sleep(120 if waiting else POWER_CHECK_SECONDS)
 
 
 def num(x):
