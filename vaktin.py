@@ -792,8 +792,16 @@ def release_timings(root, cfg, tags, runs):
     for t in tags:
         sem = t[1:] if t[:1] == "v" else t
         row = {}
-        parent = run(["git", "rev-parse", f"{t}^"], cwd=root)
-        g = _gate_for(root, cfg, parent)
+        # The proving gate is the nearest ancestor whose gate really RAN: the
+        # tag is the version bump, and the commits just under it are often
+        # release notes whose gate was reused, skipped or cancelled.
+        g = None
+        for sha in run(["git", "rev-list", "--max-count", "8", f"{t}^"], cwd=root).split():
+            cand = _gate_for(root, cfg, sha)
+            if cand and cand.get("done") and cand.get("conclusion") in ("success", "failure") \
+                    and cand.get("mins", 0) >= 2:
+                g = cand
+                break
         if g:
             row["gate"] = g
         d = runs.get(t)
@@ -1776,6 +1784,8 @@ def gather():
 
 # ── page ─────────────────────────────────────────────────────────────────────
 CSS = """
+a.runlink{color:inherit;text-decoration:none;font-weight:600}a.runlink:hover{text-decoration:underline}
+.c-time{white-space:nowrap;font-size:12px}
 *{box-sizing:border-box}
 :root{--bg:#f4f5f9;--card:#fff;--ink:#12141c;--muted:#666e85;--line:#e2e5ee;
       --accent:#37478f;--ok:#1d7a4c;--warn:#9a6300;--bad:#b3261e;--busy:#37478f}
@@ -1876,7 +1886,8 @@ code{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:12px;
  .c-tag{grid-row:1;grid-column:1}
  .c-state{grid-row:1;grid-column:2;justify-self:start}
  .c-rtitle{grid-row:2;grid-column:1/-1}
- .c-note{grid-row:3;grid-column:1/-1}
+ .c-note{grid-row:4;grid-column:1/-1}
+ .c-time{grid-row:3;grid-column:1/-1;white-space:normal}
  .c-branch{grid-row:1;grid-column:1/3}
  .c-ahead{grid-row:1;grid-column:3;justify-self:end}
  .c-subject{grid-row:2;grid-column:1/-1}
@@ -2282,7 +2293,7 @@ def history_section(p):
             kind, label = "busy", ("í gangi" if r.get("status") == "in_progress" else "í biðröð")
         name = html.escape(r.get("name") or "")
         if r.get("url"):
-            name = f'<a href="{html.escape(r["url"])}">{name}</a>'
+            name = f'<a class="runlink" href="{html.escape(r["url"])}">{name}</a>'
         ref = html.escape(r.get("ref") or "")
         took = _mins(r.get("mins")) + ("" if r.get("done") else " hingað til")
         s.append(f'<tr><td class="mono">{when}</td><td>{name}'
