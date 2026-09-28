@@ -212,3 +212,33 @@ class TestRunnerPower(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRunTiming(unittest.TestCase):
+    def test_epoch_takes_balena_millis(self):
+        self.assertEqual(v._epoch("2026-09-28T15:20:34.871Z"), v._epoch("2026-09-28T15:20:34Z"))
+        self.assertGreater(v._epoch("2026-09-28T15:20:34Z"), 0)
+        self.assertEqual(v._epoch("garbage"), 0)
+
+    def test_timing_cell_shows_only_what_is_known(self):
+        cell = v.timing_cell({"gate": {"mins": 22, "conclusion": "success"}, "build_mins": 4, "total_mins": 31})
+        self.assertIn("hlið 22 mín", cell)
+        self.assertIn("bygging 4 mín", cell)
+        self.assertIn("alls 31 mín", cell)
+        self.assertEqual(v.timing_cell({}), "")
+        self.assertIn("(failure)", v.timing_cell({"gate": {"mins": 5, "conclusion": "failure"}}))
+        self.assertIn("1 klst 5 mín", v.timing_cell({"build_mins": 65}))
+
+    def test_history_section_renders_runs(self):
+        p = {"history": [
+            {"name": "E2E control gate", "title": "feat: x", "ref": "main", "status": "completed",
+             "conclusion": "success", "start": 1790000000, "mins": 22, "done": True, "url": "https://example.test/1"},
+            {"name": "Tests", "title": "feat: y", "ref": "main", "status": "in_progress",
+             "conclusion": "", "start": 1790000000, "mins": 3, "done": False, "url": ""}]}
+        out = v.history_section(p)
+        self.assertIn("Keyrslusaga", out)
+        self.assertIn("tókst", out)
+        self.assertIn("í gangi", out)
+        self.assertIn("22 mín", out)
+        self.assertIn("3 mín hingað til", out)
+        self.assertEqual(v.history_section({"history": []}), "")

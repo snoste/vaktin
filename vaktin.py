@@ -297,16 +297,25 @@ def _built_openbalena(cfg):
     return built, True
 
 
+_balena_times = {}        # semver → (build start, build end) epoch, filled by _built_balena
+
+
 def _built_balena(cfg):
     raw = run(["balena", "release", "list", cfg["fleet"], "--json"], 40)
     if not raw:
         return {}, False                      # configured but unreachable
     built = {}
+    _balena_times.clear()
     try:
         for r in json.loads(raw):
             sem = r.get("semver")
             if not sem:
                 continue
+            # When the build ran, for the release timing columns. The newest
+            # SUCCESSFUL build of a semver is the one that shipped.
+            if r.get("status") == "success" and sem not in _balena_times:
+                _balena_times[sem] = (_epoch(r.get("start_timestamp") or r.get("created_at") or ""),
+                                      _epoch(r.get("end_timestamp") or ""))
             # is_final matters as much as status: a DRAFT built fine but no
             # device will ever take it, so calling it "shipped" is a lie.
             entry = (r.get("status", "?"), bool(r.get("is_final")))
@@ -704,6 +713,7 @@ def releases(root, cfg):
             if r and r.get("job_mins"):
                 r["peers"] = sum(1 for s in spans if abs(s - r["job_mins"]) <= 1)
 
+    timings = release_timings(root, cfg, tags, runs) if ok is not None else {}
     out = []
     for t in tags:
         sem = t[1:] if t[:1] == "v" else t
@@ -730,8 +740,109 @@ def releases(root, cfg):
             state = "unknown"
         out.append({"tag": t, "state": state, "note": note,
                     "ob_state": _state_of(sem, ob_built, ob_ok),
-                    "title": titles.get(sem) or tag_subject(root, t)})
+                    "title": titles.get(sem) or tag_subject(root, t),
+                    "timing": timings.get(t) or {}})
     return out, ok
+
+
+_gate_cache = {}          # commit sha → finished gate run {mins, conclusion, start, end}
+
+
+def _run_span(r):
+    """(start, end, minutes) of a gh run row; minutes 0 when unknown."""
+    a, b = _epoch(r.get("startedAt") or ""), _epoch(r.get("updatedAt") or "")
+    return a, b, (int(round((b - a) / 60)) if a and b and b >= a else 0)
+
+
+def _gate_for(root, cfg, sha):
+    """The gate run that proved this commit (the newest non-cancelled one).
+    A FINISHED run is cached for good: its numbers can never change."""
+    wf = cfg.get("gate_workflow")
+    if not wf or not sha:
+        return None
+    if sha in _gate_cache:
+        return _gate_cache[sha]
+    raw = run(["gh", "run", "list", "--workflow", wf, "--commit", sha, "--limit", "5", "--json",
+               "conclusion,status,startedAt,updatedAt,databaseId"], 25, root)
+    try:
+        rows = [r for r in json.loads(raw or "[]") if r.get("conclusion") != "cancelled"]
+    except Exception:
+        return None
+    if not rows:
+        return None
+    r = rows[0]
+    a, b, mins = _run_span(r)
+    out = {"mins": mins, "conclusion": r.get("conclusion") or r.get("status") or "",
+           "start": a, "end": b, "done": r.get("status") == "completed"}
+    if out["done"]:
+        _gate_cache[sha] = out
+    return out
+
+
+def release_timings(root, cfg, tags, runs):
+    """How long each release took, three honest numbers per tag:
+      · gate   — the CI gate on the code that shipped (the tag's parent: the
+                 tag itself is release.sh's version bump, which reuses that
+                 verdict instead of running its own),
+      · deploy — the deploy workflow run for the tag,
+      · total  — from the gate starting to the balenaCloud build finishing,
+                 i.e. how long it took from code pushed to a buildable release.
+    Any part that cannot be read is left out rather than guessed."""
+    out = {}
+    for t in tags:
+        sem = t[1:] if t[:1] == "v" else t
+        row = {}
+        parent = run(["git", "rev-parse", f"{t}^"], cwd=root)
+        g = _gate_for(root, cfg, parent)
+        if g:
+            row["gate"] = g
+        d = runs.get(t)
+        if d and d.get("mins") is not None and d.get("status") == "completed":
+            row["deploy_mins"] = d["mins"]
+        bstart, bend = _balena_times.get(sem, (0, 0))
+        if bstart and bend and bend >= bstart:
+            row["build_mins"] = int(round((bend - bstart) / 60))
+        tag_ts = 0
+        try:
+            tag_ts = int(run(["git", "log", "-1", "--format=%ct", t], cwd=root) or 0)
+        except ValueError:
+            pass
+        start = (g or {}).get("start") or tag_ts
+        if start and bend and bend >= start:
+            row["total_mins"] = int(round((bend - start) / 60))
+        if tag_ts and bend and bend >= tag_ts:
+            row["tag_to_built_mins"] = int(round((bend - tag_ts) / 60))
+        out[t] = row
+    return out
+
+
+_history_cache = {"at": 0, "rows": [], "root": None}
+HISTORY_CACHE_SECONDS = 60
+
+
+def run_history(root, limit=30):
+    """Every workflow's recent runs, newest first: what ran, on what, how it
+    ended, how long it waited to start and how long it ran."""
+    if (_history_cache["root"] == root and _history_cache["rows"]
+            and time.time() - _history_cache["at"] < HISTORY_CACHE_SECONDS):
+        return _history_cache["rows"]
+    raw = run(["gh", "run", "list", "--limit", str(limit), "--json",
+               "name,displayTitle,headBranch,event,status,conclusion,createdAt,"
+               "startedAt,updatedAt,databaseId,url"], 30, root)
+    rows = []
+    try:
+        for r in json.loads(raw or "[]"):
+            a, b, mins = _run_span(r)
+            done = r.get("status") == "completed"
+            rows.append({"name": r.get("name") or "", "title": r.get("displayTitle") or "",
+                         "ref": r.get("headBranch") or "", "event": r.get("event") or "",
+                         "status": r.get("status") or "", "conclusion": r.get("conclusion") or "",
+                         "start": a, "mins": mins if done else int(round((time.time() - a) / 60)) if a else 0,
+                         "done": done, "url": r.get("url") or ""})
+    except Exception:
+        rows = []
+    _history_cache.update(at=time.time(), rows=rows, root=root)
+    return rows
 
 
 def in_flight(root, cfg):
@@ -1028,7 +1139,10 @@ def _save_failures(cfg, store):
 
 
 def _epoch(s):
+    """UTC ISO time to epoch. Tolerates fractional seconds (balena writes
+    2026-09-28T15:20:34.871Z; GitHub writes whole seconds)."""
     try:
+        s = re.sub(r"\.\d+Z$", "Z", s or "")
         return int(time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone)
     except Exception:
         return 0
@@ -1649,6 +1763,7 @@ def gather():
             "built_ok": ok, "built_why": _cloud_run_why, "runs": runs, "eta": eta,
             "note": cfg.get("note", ""),
             "failures": fails, "repeats": repeats,
+            "history": run_history(root),
         })
     data = {"projects": projects, "sessions": sessions(roots),
             "runners": _runners, "github_runners": gh_runner_rows,
@@ -1980,7 +2095,7 @@ def project_section(p, multi):
     s.append('<h2>Útgáfur — merki → byggð?</h2><div class="card"><table class="stack">'
              '<tr class="hd"><th>Merki</th><th>Hvað</th>'
              + ('<th>balenaCloud</th><th>openBalena</th>' if two else '<th>Staða</th>')
-             + '<th></th></tr>')
+             + '<th>Tími</th><th></th></tr>')
     OB = {"shipped": ("ok", "komin út"), "draft": ("warn", "drög"), "not-built": ("bad", "ALDREI BYGGÐ"),
           "running": ("busy", "byggist"), "unknown": ("idle", "óþekkt")}
     for r in p["releases"]:
@@ -2009,6 +2124,7 @@ def project_section(p, multi):
         s.append(f'<tr><td class="c-tag mono">{html.escape(r["tag"])}</td>'
                  f'<td class="c-rtitle">{clip(title) if title else ""}</td>'
                  f'<td class="c-state">{pill(label, kind)}</td>{ob_cell}'
+                 f'<td class="c-time mono">{timing_cell(r.get("timing") or {})}</td>'
                  f'<td class="c-note muted">{clip(note) if note else ""}</td></tr>')
     s.append("</table></div>")
     if p["built_ok"] is False:
@@ -2019,6 +2135,8 @@ def project_section(p, multi):
         s.append('<div class="hint">Ekkert <code>fleet</code> eða '
                  '<code>cloud_run</code> í <code>.vaktin.json</code> — merki eru '
                  'sýnd án byggingarstöðu.</div>')
+
+    s.append(history_section(p))
 
     # failures — why a run failed, kept for as long as the page is
     s.append(failures_section(p))
@@ -2121,6 +2239,58 @@ def tools():
             out.append({"name": name.strip(), "url": url.strip(),
                         "local": "127.0.0.1" in url or "localhost" in url})
     return out
+
+
+def _mins(m):
+    if m is None:
+        return ""
+    return f"{m // 60} klst {m % 60} mín" if m >= 60 else f"{m} mín"
+
+
+def timing_cell(t):
+    """'hlið 22 mín · bygging 4 mín' over 'alls 31 mín', only the parts known."""
+    parts = []
+    g = t.get("gate")
+    if g:
+        mark = "" if g.get("conclusion") == "success" else f' ({html.escape(g.get("conclusion") or "")})'
+        parts.append(f'hlið {_mins(g.get("mins"))}{mark}')
+    if t.get("build_mins") is not None:
+        parts.append(f'bygging {_mins(t["build_mins"])}')
+    elif t.get("deploy_mins") is not None:
+        parts.append(f'dreifing {_mins(t["deploy_mins"])}')
+    top = " · ".join(parts)
+    total = t.get("total_mins")
+    bottom = (f'<div class="muted">alls {_mins(total)} frá hliði til byggingar</div>'
+              if total is not None else "")
+    return top + bottom          # every part is built from numbers and escaped words
+
+
+def history_section(p):
+    rows = p.get("history") or []
+    if not rows:
+        return ""
+    s = ['<h2>Keyrslusaga — hvað keyrði og hve lengi</h2><div class="card"><table class="stack">'
+         '<tr class="hd"><th>Hvenær</th><th>Keyrsla</th><th>Á</th><th>Niðurstaða</th><th>Tók</th></tr>']
+    OUT = {"success": ("ok", "tókst"), "failure": ("bad", "féll"), "cancelled": ("idle", "hætt við"),
+           "skipped": ("idle", "sleppt"), "startup_failure": ("bad", "fór ekki af stað"),
+           "timed_out": ("bad", "tími rann út")}
+    for r in rows:
+        when = time.strftime("%d.%m %H:%M", time.localtime(r["start"])) if r.get("start") else ""
+        if r.get("done"):
+            kind, label = OUT.get(r.get("conclusion"), ("idle", r.get("conclusion") or "?"))
+        else:
+            kind, label = "busy", ("í gangi" if r.get("status") == "in_progress" else "í biðröð")
+        name = html.escape(r.get("name") or "")
+        if r.get("url"):
+            name = f'<a href="{html.escape(r["url"])}">{name}</a>'
+        ref = html.escape(r.get("ref") or "")
+        took = _mins(r.get("mins")) + ("" if r.get("done") else " hingað til")
+        s.append(f'<tr><td class="mono">{when}</td><td>{name}'
+                 f'<div class="muted">{clip(r.get("title") or "")}</div></td>'
+                 f'<td class="mono">{ref}</td><td>{pill(label, kind)}</td>'
+                 f'<td class="mono">{took}</td></tr>')
+    s.append("</table></div>")
+    return "".join(s)
 
 
 def page(d):
