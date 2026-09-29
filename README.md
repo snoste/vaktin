@@ -163,6 +163,12 @@ line of your own in `~/.config/vaktin/alert-cmd` (or `VAKTIN_ALERT_CMD`), run wi
 the message on stdin and in `$VAKTIN_MSG`; a phone push through a topic on
 ntfy.sh is one line of `curl`. No file, no alerts.
 
+## Devices
+
+Under a project's runs, one row per device of its fleets: online or not, the release it runs, the one it should run (its pin, or the fleet default it follows), and a progress bar while an update downloads. balenaCloud has a dashboard for this; a self-hosted openBalena has none, and both answer the same API. Updating devices sort first, then offline ones, then devices waiting for their update.
+
+Config lives in the watched repo's `.vaktin.json`: `fleet` for balenaCloud (token read from `~/.balena/token`, or `balena_token`), and `token` inside the `openbalena` block for a self-hosted instance (`url` and `fleet` as for builds). Read-only.
+
 ## Runner power
 
 Under the runner list, one bar per machine: how much it can do next to the runner GitHub would lend you. Every box runs the same small test (zlib over a fixed megabyte, one core and then all of them), so the ratios mean something even though the number itself is only a yardstick.

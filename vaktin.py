@@ -56,6 +56,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # gcloud writes a log file for every command and keeps 30 days of them. Polling Cloud Run every
@@ -1745,6 +1747,131 @@ def power_html(pw):
     return "".join(s)
 
 
+# ── devices: what each device runs, and its update while it happens ─────────
+# balenaCloud has a dashboard for this; a self-hosted openBalena has none. Both
+# answer the same API, so one panel shows every device of a project's fleets:
+# online or not, the release it runs, the one it should run, and the download
+# while an update is under way. Read-only; the page refreshes itself, so an
+# update's progress moves as you watch. Config, in the watched repo's
+# .vaktin.json (never here):
+#   "fleet": "<org>/<fleet>"                  balenaCloud, token ~/.balena/token
+#                                             (override with "balena_token")
+#   "openbalena": {"url": "balena.example.is", "fleet": "<org>/<fleet>",
+#                  "token": "~/.balena-example/token"}
+UPDATING = ("updating", "downloading", "installing", "configuring")
+
+
+def device_targets(cfg):
+    out = []
+    if cfg.get("fleet"):
+        out.append({"label": "balenaCloud", "api": "https://api.balena-cloud.com",
+                    "token": cfg.get("balena_token", "~/.balena/token"), "fleet": cfg["fleet"]})
+    ob = cfg.get("openbalena") or {}
+    if ob.get("url") and ob.get("fleet") and ob.get("token"):
+        out.append({"label": "openBalena", "api": "https://api." + ob["url"],
+                    "token": ob["token"], "fleet": ob["fleet"]})
+    return out
+
+
+def _release_name(rel):
+    """The first expanded release's version, or ''."""
+    if isinstance(rel, list) and rel:
+        rel = rel[0]
+    if not isinstance(rel, dict):
+        return ""
+    return rel.get("raw_version") or rel.get("semver") or ""
+
+
+def devices_from(payload, label):
+    """Rows for one fleet from the API's application document (pure: tests feed it)."""
+    rows = []
+    for app in (payload or {}).get("d", []):
+        default = _release_name(app.get("should_be_running__release"))
+        for dv in app.get("owns__device") or []:
+            status = str(dv.get("overall_status") or "").lower()
+            running = _release_name(dv.get("is_running__release"))
+            pinned = _release_name(dv.get("should_be_running__release"))
+            rows.append({
+                "target": label,
+                "name": dv.get("device_name") or "?",
+                "uuid": (dv.get("uuid") or "")[:7],
+                "online": bool(dv.get("is_online")),
+                "status": status,
+                "progress": dv.get("overall_progress"),
+                "running": running,
+                "pinned": pinned,
+                "follows": "" if pinned else default,
+                "seen": _epoch(dv.get("last_connectivity_event") or ""),
+            })
+    return rows
+
+
+def device_state(r):
+    """(order, pill kind, pill text, note) for one row: updates first, then trouble."""
+    want = r["pinned"] or r["follows"]
+    if r["online"] and (r["status"] in UPDATING or r["progress"] is not None):
+        pct = r["progress"]
+        return 0, "busy", "uppfærir" + (f" {int(pct)}%" if isinstance(pct, (int, float)) else ""), f"í {want}" if want else ""
+    if not r["online"]:
+        return 1, "bad", "aftengt", (f"sást síðast {ago(time.time() - r['seen'])}" if r["seen"] else "")
+    if want and r["running"] and r["running"] != want:
+        return 2, "warn", "bíður uppfærslu", f"á að fá {want}"
+    return 3, "ok", "á netinu", ""
+
+
+def fleet_devices(cfg):
+    """(rows, errors) for every configured fleet of a project."""
+    rows, errors = [], []
+    for t in device_targets(cfg):
+        try:
+            with open(os.path.expanduser(t["token"])) as f:
+                token = f.read().strip()
+        except OSError:
+            errors.append(f"{t['label']}: enginn aðgangslykill á {t['token']}")
+            continue
+        rel = "$select=raw_version,semver"
+        q = ("application?$filter=slug%20eq%20'" + urllib.parse.quote(t["fleet"].lower(), safe="/") + "'"
+             "&$select=id&$expand=should_be_running__release($select=raw_version,semver),"
+             "owns__device($select=device_name,uuid,is_online,overall_status,overall_progress,last_connectivity_event;"
+             f"$expand=is_running__release({rel}),should_be_running__release({rel}))")
+        req = urllib.request.Request(t["api"] + "/v6/" + q.replace("$", "%24").replace(" ", "%20"),
+                                     headers={"Authorization": "Bearer " + token})
+        try:
+            with urllib.request.urlopen(req, timeout=12) as r:
+                rows += devices_from(json.load(r), t["label"])
+        except Exception as e:
+            errors.append(f"{t['label']}: náðist ekki ({str(e)[:60]})")
+    rows.sort(key=lambda r: (device_state(r)[0], r["name"].lower()))
+    return rows, errors
+
+
+def devices_section(p):
+    rows, errors = p.get("devices") or ([], [])
+    if not rows and not errors:
+        return ""
+    s = ['<h2>Tæki — hvað keyrir hvar</h2><div class="card">']
+    if rows:
+        two = len({r["target"] for r in rows}) > 1
+        s.append('<table class="stack"><tr class="hd"><th>Tæki</th>' + ('<th>Ský</th>' if two else '')
+                 + '<th>Staða</th><th>Keyrir</th><th>Á að keyra</th><th></th></tr>')
+        for r in rows:
+            _, kind, label, note = device_state(r)
+            pct = r["progress"] if kind == "busy" and isinstance(r["progress"], (int, float)) else None
+            tr = f'<tr class="prog" style="--pct:{max(0, min(100, pct)):.0f}%">' if pct is not None else "<tr>"
+            want = r["pinned"] or (f'fylgir flota ({r["follows"]})' if r["follows"] else "—")
+            s.append(f'{tr}<td class="c-dev">{clip(r["name"], 1)} <span class="muted mono">{html.escape(r["uuid"])}</span></td>'
+                     + (f'<td class="c-cloud muted">{html.escape(r["target"])}</td>' if two else '')
+                     + f'<td class="c-state">{pill(label, kind)}</td>'
+                     f'<td class="c-run mono">{html.escape(r["running"] or "—")}</td>'
+                     f'<td class="c-pin mono muted">{html.escape(want)}</td>'
+                     f'<td class="c-note muted">{clip(note, 1) if note else ""}</td></tr>')
+        s.append("</table>")
+    s.append("</div>")
+    for e in errors:
+        s.append(f'<div class="hint">{html.escape(e)}</div>')
+    return "".join(s)
+
+
 _cache = {"at": 0, "data": None}
 
 
@@ -1772,6 +1899,7 @@ def gather():
             "note": cfg.get("note", ""),
             "failures": fails, "repeats": repeats,
             "history": run_history(root),
+            "devices": fleet_devices(cfg),
         })
     data = {"projects": projects, "sessions": sessions(roots),
             "runners": _runners, "github_runners": gh_runner_rows,
@@ -2100,6 +2228,9 @@ def project_section(p, multi):
     s.append("</div>")
     if p["eta"]:
         s.append(f'<div class="hint">Miðgildi útgáfukeyrslu: {p["eta"]} mín.</div>')
+
+    # devices — balenaCloud has a dashboard for this, openBalena has none
+    s.append(devices_section(p))
 
     # releases — the join that catches a tag which never built
     two = any(r.get("ob_state") not in (None, "unconfigured") for r in p["releases"])

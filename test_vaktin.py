@@ -210,6 +210,42 @@ class TestRunnerPower(unittest.TestCase):
         self.assertNotIn("c", hosts)
 
 
+class TestDevices(unittest.TestCase):
+    PAYLOAD = {"d": [{"should_be_running__release": [{"raw_version": "2.0.0"}], "owns__device": [
+        {"device_name": "b-idle", "uuid": "aaaaaaaaaa", "is_online": True, "overall_status": "idle",
+         "overall_progress": None, "is_running__release": [{"raw_version": "1.9.0"}],
+         "should_be_running__release": [{"raw_version": "1.9.0"}], "last_connectivity_event": "2026-01-01T00:00:00.000Z"},
+        {"device_name": "c-updating", "uuid": "bbbbbbbbbb", "is_online": True, "overall_status": "updating",
+         "overall_progress": 45, "is_running__release": [{"raw_version": "1.9.0"}],
+         "should_be_running__release": [{"raw_version": "2.0.0"}]},
+        {"device_name": "a-off", "uuid": "cccccccccc", "is_online": False, "overall_status": "offline",
+         "overall_progress": None, "is_running__release": [{"raw_version": "1.8.0"}],
+         "should_be_running__release": [], "last_connectivity_event": "2026-01-01T00:00:00.000Z"},
+        {"device_name": "d-behind", "uuid": "dddddddddd", "is_online": True, "overall_status": "idle",
+         "overall_progress": None, "is_running__release": [{"raw_version": "1.8.0"}], "should_be_running__release": []},
+    ]}]}
+
+    def test_rows_and_states(self):
+        rows = v.devices_from(self.PAYLOAD, "cloud")
+        by = {r["name"]: r for r in rows}
+        self.assertEqual(by["a-off"]["follows"], "2.0.0")
+        self.assertEqual(v.device_state(by["c-updating"])[1:3], ("busy", "uppfærir 45%"))
+        self.assertEqual(v.device_state(by["a-off"])[1], "bad")
+        self.assertEqual(v.device_state(by["d-behind"])[1:3], ("warn", "bíður uppfærslu"))
+        self.assertEqual(v.device_state(by["b-idle"])[1], "ok")
+
+    def test_the_panel_orders_updates_first_and_draws_progress(self):
+        rows = sorted(v.devices_from(self.PAYLOAD, "cloud"), key=lambda r: (v.device_state(r)[0], r["name"]))
+        page = v.devices_section({"devices": (rows, [])})
+        self.assertLess(page.index("c-updating"), page.index("a-off"))
+        self.assertIn('--pct:45%', page)
+        self.assertIn("fylgir flota (2.0.0)", page)
+
+    def test_no_fleet_no_panel(self):
+        self.assertEqual(v.device_targets({}), [])
+        self.assertEqual(v.devices_section({}), "")
+
+
 if __name__ == "__main__":
     unittest.main()
 
