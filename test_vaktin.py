@@ -154,6 +154,39 @@ class TestRunnerAlerts(unittest.TestCase):
         self.assertFalse(v.send_alert("x"))
 
 
+class TestRunnerBusy(unittest.TestCase):
+    """The revival must never kickstart a runner with a job on it. A
+    self-updated runner runs its job from bin.<version>/Runner.Worker, and a
+    check for bin/ alone never saw it (2026-10-05)."""
+
+    def _spawn(self, root, folder, name):
+        """A process whose command line is the runner binary's path: /bin/sleep
+        run under that name (macOS kills a copied platform binary on sight)."""
+        import subprocess
+        argv0 = os.path.join(root, folder, name)
+        proc = subprocess.Popen([argv0, "30"], executable="/bin/sleep")
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        time.sleep(0.3)
+        return proc
+
+    def test_a_job_from_a_versioned_folder_is_seen(self):
+        with tempfile.TemporaryDirectory() as root:
+            rdir = os.path.join(root, "actions-runner-demo")
+            self.assertFalse(v._runner_busy(rdir))
+            self._spawn(rdir, "bin.2.337.0", "Runner.Worker")
+            self.assertTrue(v._runner_busy(rdir))
+            # another runner's job is not this one's
+            self.assertFalse(v._runner_busy(rdir + "-other"))
+
+    def test_the_listener_is_seen_from_either_folder(self):
+        with tempfile.TemporaryDirectory() as root:
+            rdir = os.path.join(root, "actions-runner-demo")
+            self.assertFalse(v._listener_alive(rdir))
+            self._spawn(rdir, "bin", "Runner.Listener")
+            self.assertTrue(v._listener_alive(rdir))
+
+
 class TestRunnerPower(unittest.TestCase):
     ROWS = [{"name": "big", "online": True, "busy": False}, {"name": "big-2", "online": True, "busy": True},
             {"name": "small", "online": False, "busy": False}, {"name": "unknown", "online": True, "busy": False}]

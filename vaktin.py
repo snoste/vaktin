@@ -1393,15 +1393,24 @@ def gh_runners(root):
     return rows
 
 
+def _runner_process_pattern(rdir, name):
+    """pgrep -f pattern for one of a runner's binaries. A self-updated runner
+    runs them from the versioned folder the update leaves behind
+    (bin.2.337.0/Runner.Worker), not bin/: a pattern for bin/ alone never
+    matched a busy runner, so the stale-queue revival kickstarted runners in
+    the middle of jobs and killed them (2026-10-05, four release gates)."""
+    return re.escape(rdir) + r"/bin[^/]*/" + re.escape(name)
+
+
 def _listener_alive(rdir):
-    return subprocess.run(["pgrep", "-f", os.path.join(rdir, "bin", "Runner.Listener")],
+    return subprocess.run(["pgrep", "-f", _runner_process_pattern(rdir, "Runner.Listener")],
                           capture_output=True).returncode == 0
 
 
 def _runner_busy(rdir):
     """A runner executing a job has a Runner.Worker child. A stale-queue
     revival must NEVER kickstart a busy runner — that kills a live job."""
-    return subprocess.run(["pgrep", "-f", os.path.join(rdir, "bin", "Runner.Worker")],
+    return subprocess.run(["pgrep", "-f", _runner_process_pattern(rdir, "Runner.Worker")],
                           capture_output=True).returncode == 0
 
 
