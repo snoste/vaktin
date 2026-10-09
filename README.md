@@ -157,6 +157,18 @@ The JSON is the same structure the page renders: `projects[]` each with
 
 ## Alerts
 
+Two kinds of line go to the alert command, and nothing else (2026-10-09): a
+runner that stays offline (and its return), and the CI events that need a
+person: a release run that did not build (the deploy workflow or any run on a
+tag ending failure, timed out, startup failure, or cancelled past the gate
+timeout), and a trunk that stays red (the newest completed Tests, E2E or
+Security run on the trunk red with no green follower for `VAKTIN_CI_RED_AFTER_MIN`,
+default 90; one line when it crosses, one when the trunk is green again). A red
+branch, a cancellation or a single flaky shard never pages anyone: GitHub's own
+"Run failed" mails (79 in one week, most of them one cause fanned out over
+branches and reruns) are what this replaces.
+
+
 A runner registered with GitHub that stays offline for two checks (about four
 minutes) triggers one alert, and its return triggers another. The alert is a shell
 line of your own in `~/.config/vaktin/alert-cmd` (or `VAKTIN_ALERT_CMD`), run with

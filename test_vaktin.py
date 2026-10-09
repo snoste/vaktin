@@ -311,3 +311,53 @@ class TestRunTiming(unittest.TestCase):
         self.assertIn("22 mín", out)
         self.assertIn("3 mín hingað til", out)
         self.assertEqual(v.history_section({"history": []}), "")
+
+
+class TestCiAlerts(unittest.TestCase):
+    """What needs a person (2026-10-09): a release that did not build, and a
+    trunk that stays red; never a branch, a cancellation or a single shard."""
+    CFG = {"trunk": "main", "deploy_workflow": "Deploy to Balena", "tag_glob": "v*", "gate_timeout_minutes": 90}
+
+    @staticmethod
+    def row(i, name, branch, conclusion, created, mins=10, status="completed", title="t"):
+        f = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        return {"databaseId": i, "name": name, "headBranch": branch, "conclusion": conclusion, "status": status,
+                "createdAt": f(created), "updatedAt": f(created + mins * 60), "displayTitle": title,
+                "url": f"https://x/runs/{i}"}
+
+    def test_a_release_that_did_not_build_alerts_once(self):
+        sent, store, now = [], {"runs": {}}, 1_800_000_000
+        rows = [self.row(1, "Deploy to Balena", "v6.5.1", "failure", now - 600),
+                self.row(2, "E2E control gate", "v6.5.2", "cancelled", now - 7200, mins=95),
+                self.row(3, "E2E control gate", "feat/x", "cancelled", now - 7200, mins=95),
+                self.row(4, "Tests", "feat/x", "failure", now - 600)]
+        self.assertTrue(v.ci_alerts(self.CFG, rows, store, now, sent.append))
+        self.assertEqual(len(sent), 2)
+        self.assertIn("v6.5.1", sent[0]); self.assertIn("ekkert byggt", sent[0])
+        self.assertIn("v6.5.2", sent[1]); self.assertIn("cancelled", sent[1])
+        self.assertFalse(v.ci_alerts(self.CFG, rows, store, now + 60, sent.append))
+        self.assertEqual(len(sent), 2, "a branch failure and a second poll send nothing")
+
+    def test_trunk_red_alerts_after_the_wait_and_green_again_once(self):
+        sent, store, now = [], {"runs": {"12": {"tests": [{"id": "tests/test_i18n.py::test_locale_complete[en]"}]}}}, 1_800_000_000
+        red = [self.row(11, "Tests", "main", "failure", now - 100 * 60), self.row(12, "Tests", "main", "failure", now - 20 * 60),
+               self.row(13, "Tests", "main", "cancelled", now - 5 * 60), self.row(14, "Tests", "feat/y", "failure", now - 60)]
+        v.ci_alerts(self.CFG, red, store, now - 95 * 60, sent.append)
+        self.assertEqual(sent, [], "not before CI_RED_AFTER_MIN")
+        self.assertTrue(v.ci_alerts(self.CFG, red, store, now, sent.append))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("main er rauð: Tests", sent[0]); self.assertIn("100 mín", sent[0]); self.assertIn("test_locale_complete[en]", sent[0])
+        v.ci_alerts(self.CFG, red, store, now + 300, sent.append)
+        self.assertEqual(len(sent), 1, "once per streak")
+        green = red + [self.row(15, "Tests", "main", "success", now + 400, title="fix(i18n): the English")]
+        v.ci_alerts(self.CFG, green, store, now + 1000, sent.append)
+        self.assertEqual(len(sent), 2); self.assertIn("græn aftur", sent[1])
+        v.ci_alerts(self.CFG, green, store, now + 2000, sent.append)
+        self.assertEqual(len(sent), 2)
+
+    def test_a_red_trunk_fixed_within_the_wait_is_silent(self):
+        sent, store, now = [], {"runs": {}}, 1_800_000_000
+        rows = [self.row(21, "E2E control gate", "main", "failure", now - 80 * 60),
+                self.row(22, "E2E control gate", "main", "success", now - 30 * 60)]
+        self.assertFalse(v.ci_alerts(self.CFG, rows, store, now, sent.append) and sent)
+        self.assertEqual(sent, [])

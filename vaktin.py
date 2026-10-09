@@ -49,6 +49,7 @@ interface. See the README.
 """
 import glob
 import html
+import fnmatch
 import json
 import os
 import re
@@ -1163,7 +1164,7 @@ def collect_failures(root, cfg):
     failures fixed by the first green run that followed on the same branch."""
     store = load_failures(cfg)
     runs = store["runs"]
-    fields = "databaseId,name,conclusion,status,headBranch,headSha,displayTitle,createdAt,updatedAt"
+    fields = "databaseId,name,conclusion,status,headBranch,headSha,displayTitle,createdAt,updatedAt,url"
     raw = run(["gh", "run", "list", "--limit", str(FAIL_RUNS), "--json", fields], 30, root)
     try:
         listed = json.loads(raw or "[]")
@@ -1248,9 +1249,102 @@ def collect_failures(root, cfg):
             rec["fixed"] = {"sha": (g.get("headSha") or "")[:7], "title": g.get("displayTitle") or "",
                             "created": _epoch(g.get("createdAt") or ""), "id": str(g.get("databaseId") or "")}
             changed = True
+    if ci_alerts(cfg, listed, store):
+        changed = True
     if changed:
         _save_failures(cfg, store)
     return store
+
+
+# ── alerts: what needs a PERSON, not a session (2026-10-09) ──────────────────
+# GitHub mails the repository owner for every failed run (79 mails in the week
+# of 10-02, most of them one cause fanned out over branches and reruns that a
+# session fixed within hours), so those mails are off and this is what replaces
+# them: one line to the alert command only when
+#   1. a RELEASE run did not build: the deploy workflow, or any run on a tag,
+#      ending failure / timed out / startup failure, or cancelled after the gate
+#      timeout (a shipped tag can never be reused, so this is always a person's
+#      problem);
+#   2. TRUNK stays red: the newest completed Tests, E2E or Security run on the
+#      trunk is red and no green run has followed for CI_RED_AFTER_MIN. One line
+#      when it crosses the threshold, one when the trunk is green again.
+# A failed run on a branch, a cancelled run (a newer push evicting the older),
+# a single flaky shard: never. State lives in the failure store (store["alerts"]).
+CI_RED_AFTER_MIN = int(os.environ.get("VAKTIN_CI_RED_AFTER_MIN", "90"))
+CI_TRUNK_WORKFLOWS = ("Tests", "E2E control gate", "Security")
+CI_BAD = ("failure", "timed_out", "startup_failure")
+
+
+def _ci_tests_of(store, rid):
+    rec = (store.get("runs") or {}).get(str(rid)) or {}
+    names = [t["id"].split("::")[-1].split(" › ")[-1][:48] for t in rec.get("tests") or []]
+    return ", ".join(names[:3]) + (" …" if len(names) > 3 else "")
+
+
+def ci_alerts(cfg, listed, store, now=None, send=None):
+    """One poll's alert decisions over the `gh run list` rows. Returns True
+    when store["alerts"] changed (the caller saves). `send` is injected in
+    tests; the real one is send_alert."""
+    now = time.time() if now is None else now
+    send = send or send_alert
+    st = store.setdefault("alerts", {"runs": {}, "trunk": {}})
+    st.setdefault("runs", {}); st.setdefault("trunk", {})
+    changed = False
+    trunk = cfg.get("trunk") or "main"
+    deploy_wf = cfg.get("deploy_workflow") or ""
+    tag_glob = cfg.get("tag_glob") or "v*"
+    gate_min = int(cfg.get("gate_timeout_minutes") or 90)
+    rows = [r for r in listed or [] if r.get("status") == "completed"]
+    # 1. a release that did not build
+    for r in rows:
+        rid = str(r.get("databaseId") or "")
+        ref = r.get("headBranch") or ""
+        name = r.get("name") or ""
+        if not rid or rid in st["runs"]:
+            continue
+        release = (deploy_wf and name == deploy_wf) or fnmatch.fnmatch(ref, tag_glob)
+        if not release:
+            continue
+        mins = max(0, (_epoch(r.get("updatedAt") or "") - _epoch(r.get("createdAt") or "")) // 60)
+        bad = r.get("conclusion") in CI_BAD or (r.get("conclusion") == "cancelled" and mins >= gate_min)
+        if not bad:
+            continue
+        st["runs"][rid] = int(now)
+        changed = True
+        send(f"Útgáfa {ref}: {name} endaði {r.get('conclusion')} eftir {mins} mín, ekkert byggt. "
+             f"{r.get('url') or ''}".strip())
+    # 2. the trunk stays red
+    for wf in CI_TRUNK_WORKFLOWS:
+        mine = sorted([r for r in rows if (r.get("name") or "") == wf and (r.get("headBranch") or "") == trunk
+                       and (r.get("conclusion") == "success" or r.get("conclusion") in CI_BAD)],
+                      key=lambda r: _epoch(r.get("createdAt") or ""), reverse=True)
+        if not mine:
+            continue
+        state = st["trunk"].setdefault(wf, {"since": 0, "alerted": False})
+        newest = mine[0]
+        if newest.get("conclusion") == "success":
+            if state.get("alerted"):
+                send(f"{trunk} er græn aftur: {wf} ({(newest.get('displayTitle') or '')[:60]}).")
+            if state.get("since") or state.get("alerted"):
+                st["trunk"][wf] = {"since": 0, "alerted": False}
+                changed = True
+            continue
+        since = _epoch(newest.get("createdAt") or "")
+        for r in mine[1:]:                      # walk back over the red streak
+            if r.get("conclusion") == "success":
+                break
+            since = _epoch(r.get("createdAt") or "")
+        if state.get("since") != since:
+            state.update(since=since, alerted=False)
+            changed = True
+        if not state.get("alerted") and now - since >= CI_RED_AFTER_MIN * 60:
+            tests = _ci_tests_of(store, newest.get("databaseId"))
+            send(f"{trunk} er rauð: {wf} hefur verið rauð í {int((now - since) // 60)} mín "
+                 f"(síðan {time.strftime('%H:%M', time.localtime(since))})."
+                 + (f" Prófin: {tests}." if tests else "") + f" {newest.get('url') or ''}".rstrip())
+            state["alerted"] = True
+            changed = True
+    return changed
 
 
 def failures_view(store, days=90):
